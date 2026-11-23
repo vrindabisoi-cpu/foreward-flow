@@ -22,11 +22,12 @@ Both models are **logistic regressions** (scikit-learn), chosen because they're 
 
 **Reasons.** Each reason is an input's coefficient times its standardized value: how far it moves this patient's score compared with the average patient in the training data.
 
-**Likely bed type** uses fixed rules, not the model:
-1. **ICU** if triage acuity is 1, O₂ sat is below 89%, or systolic BP is below 90.
-2. **Telemetry** for chest pain, or cardiac history with heart rate above 105.
-3. **Surgery** for abdominal pain or fall/injury.
-4. Otherwise **Medicine**.
+**Likely bed type** uses fixed rules, not the model, checked in this order:
+1. **Women's & Peds** if age is under 18.
+2. **ICU** if triage acuity is 1, O₂ sat is below 89%, or systolic BP is below 90.
+3. **Telemetry** for chest pain, or cardiac history with heart rate above 105.
+4. **Surgery** for abdominal pain or fall/injury.
+5. Otherwise **Medicine**.
 
 ## Synthetic datasets
 

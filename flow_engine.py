@@ -233,8 +233,12 @@ def generate_current_ed_patients() -> pd.DataFrame:
     # Boarders come from synthetic patients whose sampled outcome was
     # "admitted", so they look like real admits. Workup patients are unselected.
     pool = _generate_visit_features(300, rng)
-    was_admitted = rng.random(len(pool)) < _sigmoid(_admission_logit(pool))
-    boarders = pool[was_admitted].head(6)
+    true_p = _sigmoid(_admission_logit(pool))
+    was_admitted = rng.random(len(pool)) < true_p
+    admits = pool[was_admitted]
+    # Demo: lead with a clear-cut adult admit (true probability > 90%).
+    lead = admits[(true_p[was_admitted] > 0.90) & (admits["age"] >= 18)].head(1)
+    boarders = pd.concat([lead, admits.drop(lead.index).head(5)])
     workup = pool.drop(boarders.index).head(8)
     df = pd.concat([boarders, workup], ignore_index=True)
 
@@ -562,7 +566,7 @@ class ExplainableLogit:
         out = []
         for idx, row in contrib.iterrows():
             top = row[row > min_effect].sort_values(ascending=False).head(n)
-            out.append([self.labeler(f, df.at[idx, f]) for f in top.index])
+            out.append([self.labeler(f, df.at[idx, f], direction) for f in top.index])
         return out
 
     def coefficients(self) -> pd.DataFrame:
@@ -592,10 +596,13 @@ ADMISSION_FEATURES = [
 assert [f.name for f in ADMISSION_FEATURES] == ED_MODEL_FEATURES
 
 
-def _admission_label(feature: str, value) -> str:
+def _admission_label(feature: str, value, direction: int = 1) -> str:
+    if feature == "triage_acuity":
+        # A reason that raises admission risk means sicker than the average patient.
+        urgency = "more" if direction > 0 else "less"
+        return f"Triage acuity {value} ({urgency} urgent than typical)"
     return {
         "age": lambda v: f"Age {v}",
-        "triage_acuity": lambda v: f"Triage acuity {v}",
         "heart_rate": lambda v: f"Heart rate {v}",
         "o2_sat": lambda v: f"O₂ sat {v}%",
         "temperature_c": lambda v: f"Temp {v}°C",
@@ -613,6 +620,8 @@ def train_admission_model(ed_visits: pd.DataFrame) -> ExplainableLogit:
 
 def predict_bed_type(row) -> tuple[str, str]:
     """Rule-based likely bed type, returned with the rule that fired."""
+    if row["age"] < 18:
+        return "Women's & Peds", f"age {row['age']} (<18)"
     icu = []
     if row["triage_acuity"] == 1:
         icu.append("acuity 1")
@@ -652,7 +661,7 @@ DISCHARGE_FEATURES = [
 ]
 
 
-def _discharge_label(feature: str, value) -> str:
+def _discharge_label(feature: str, value, direction: int = 1) -> str:
     if feature == "days_past_expected":
         v = int(value)
         if v > 0:

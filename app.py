@@ -115,7 +115,7 @@ st.dataframe(
 )
 st.caption(
     "Reasons are compared with the average ED patient in the training data. "
-    "Likely bed type uses fixed rules: ICU if acuity 1, O₂ < 89%, or systolic BP < 90; "
+    "Likely bed type uses fixed rules, checked in order: Women's & Peds if age < 18; ICU if acuity 1, O₂ < 89%, or systolic BP < 90; "
     "Telemetry for chest pain, or cardiac history with HR > 105; "
     "Surgery for abdominal pain or fall/injury; otherwise Medicine."
 )
