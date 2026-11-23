@@ -10,8 +10,15 @@ or changing one dataset never shifts the values of another.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
 import pandas as pd
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
 
 SEED = 42
 REFERENCE_DATE = pd.Timestamp("2026-11-23")  # fixed "today" for reproducibility
@@ -223,18 +230,21 @@ def generate_ed_visits(n: int = 6000) -> pd.DataFrame:
 def generate_current_ed_patients() -> pd.DataFrame:
     """14 patients in the ED now: 6 admitted & boarding, 8 still in workup."""
     rng = _rng(4)
-    df = _generate_visit_features(14, rng)
+    # Boarders come from synthetic patients whose sampled outcome was
+    # "admitted", so they look like real admits. Workup patients are unselected.
+    pool = _generate_visit_features(300, rng)
+    was_admitted = rng.random(len(pool)) < _sigmoid(_admission_logit(pool))
+    boarders = pool[was_admitted].head(6)
+    workup = pool.drop(boarders.index).head(8)
+    df = pd.concat([boarders, workup], ignore_index=True)
+
     status = ["Boarding"] * 6 + ["In workup"] * 8
     df.insert(0, "patient_id", [f"ED-{201 + i}" for i in range(14)])
     df.insert(1, "bed", [f"ED {i + 1}" for i in range(14)])
     df["status"] = status
 
-    # Boarders: skew toward Medicine since it's the tightest unit.
     df["admit_unit"] = None
-    boarding_units = rng.choice(
-        list(UNIT_CAPACITY), size=6, p=[0.5, 0.15, 0.2, 0.1, 0.05]
-    )
-    df.loc[:5, "admit_unit"] = boarding_units
+    df.loc[:5, "admit_unit"] = [predict_bed_type(r)[0] for _, r in df.loc[:5].iterrows()]
     df["hours_boarding"] = 0.0
     df.loc[:5, "hours_boarding"] = np.round(rng.uniform(1.5, 14, 6), 1)
     df["hours_in_ed"] = np.round(rng.uniform(0.5, 6, 14), 1)
@@ -251,8 +261,9 @@ MEDICAL_BARRIERS = {
     "IV antibiotics": "Remains on IV antibiotics, awaiting ID input on PO switch.",
     "PT eval": "PT eval not yet completed; unsafe to ambulate independently.",
     "Pending echo": "Echo ordered yesterday, still pending read.",
-    "Awaiting consult": "Awaiting cardiology consult note.",
+    "Pending labs": "Repeat labs and blood cultures still pending.",
 }
+PENDING_TEST_BARRIERS = {"Pending MRI", "Pending echo", "Pending labs"}
 
 SOCIAL_BARRIERS = {
     "No ride home": "Pt states no ride home; family unavailable until weekend.",
@@ -262,13 +273,19 @@ SOCIAL_BARRIERS = {
     "Insurance authorization": "Insurance authorization pending for post-acute care.",
 }
 
+MOBILITY_LEVELS = ["Independent", "Needs assistance", "Bedbound"]
+MOBILITY_NOTES = {
+    "Needs assistance": "Ambulates with walker and 1 assist.",
+    "Bedbound": "Bedbound; 2-person assist for repositioning.",
+}
+
 NOTE_OPENERS = [
     "Pt resting comfortably, VSS.",
     "A&O x4, pain controlled on current regimen.",
     "Slept well overnight, tolerating diet.",
-    "Ambulating in hallway with steady gait.",
     "Afebrile overnight, no acute events.",
 ]
+INDEPENDENT_OPENER = "Ambulating in hallway with steady gait."
 
 NOTE_CLOSERS = [
     "Will continue to monitor.",
@@ -276,6 +293,8 @@ NOTE_CLOSERS = [
     "Family updated at bedside.",
     "Discussed plan of care with pt.",
 ]
+
+PHYSICIAN_DC_NOTE = "Per MD, likely discharge today."
 
 UNIT_ROOM_PREFIX = {
     "Medicine": "M",
@@ -289,8 +308,9 @@ UNIT_ROOM_PREFIX = {
 def generate_inpatients(n: int = 40) -> pd.DataFrame:
     """Current inpatients with a short synthetic nurse note.
 
-    `medical_barriers` / `social_barriers` are the ground-truth tags used to
-    build the note text (handy for checking any note-parsing logic).
+    The structured columns (pending_test, iv_meds, mobility,
+    physician_noted_dc_today, social_barrier) match what the note says.
+    `medical_barriers` / `social_barriers` hold the specific barrier tags.
     Social barriers are more common for Medicaid and Uninsured patients.
     """
     rng = _rng(5)
@@ -308,10 +328,18 @@ def generate_inpatients(n: int = 40) -> pd.DataFrame:
                 used_rooms.add(room)
                 break
 
+        expected_los = int(rng.integers(2, 7))
+        los = max(1, expected_los + int(rng.integers(-3, 5)))
+
         med = []
         if rng.random() < 0.40:
             k = 1 if rng.random() < 0.8 else 2
             med = list(rng.choice(list(MEDICAL_BARRIERS), size=k, replace=False))
+
+        if "PT eval" in med:
+            mobility = "Needs assistance"
+        else:
+            mobility = str(rng.choice(MOBILITY_LEVELS, p=[0.75, 0.18, 0.07]))
 
         social_p = 0.55 if ins in ("Medicaid", "Uninsured") else 0.15
         soc = []
@@ -322,11 +350,16 @@ def generate_inpatients(n: int = 40) -> pd.DataFrame:
             k = 1 if rng.random() < 0.75 else 2
             soc = list(rng.choice(options, size=k, replace=False))
 
-        parts = [rng.choice(NOTE_OPENERS)]
+        physician_noted = rng.random() < (0.65 if not med and mobility != "Bedbound" else 0.08)
+
+        openers = NOTE_OPENERS + ([INDEPENDENT_OPENER] if mobility == "Independent" else [])
+        parts = [rng.choice(openers)]
         parts += [MEDICAL_BARRIERS[b] for b in med]
+        if mobility in MOBILITY_NOTES and "PT eval" not in med:
+            parts.append(MOBILITY_NOTES[mobility])
         parts += [SOCIAL_BARRIERS[b] for b in soc]
-        if not med and not soc:
-            parts.append("Medically ready; anticipate discharge today.")
+        if physician_noted:
+            parts.append(PHYSICIAN_DC_NOTE)
         parts.append(rng.choice(NOTE_CLOSERS))
 
         rows.append(
@@ -336,7 +369,14 @@ def generate_inpatients(n: int = 40) -> pd.DataFrame:
                 "room": room,
                 "age": int(ages[i]),
                 "insurance": ins,
-                "los_days": int(rng.integers(1, 12)),
+                "los_days": los,
+                "expected_los_days": expected_los,
+                "days_past_expected": los - expected_los,
+                "pending_test": int(any(b in PENDING_TEST_BARRIERS for b in med)),
+                "iv_meds": int("IV antibiotics" in med),
+                "mobility": mobility,
+                "physician_noted_dc_today": int(physician_noted),
+                "social_barrier": int(bool(soc)),
                 "nurse_note": " ".join(parts),
                 "medical_barriers": "; ".join(med),
                 "social_barriers": "; ".join(soc),
@@ -350,29 +390,42 @@ def generate_inpatients(n: int = 40) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def generate_past_inpatient_stays(n: int = 3000) -> pd.DataFrame:
-    """Patient-days from past stays with a `discharged_that_day` (1/0) outcome."""
+    """Past inpatient days with a `discharged_that_day` (1/0) outcome."""
     rng = _rng(6)
     units = rng.choice(list(UNIT_CAPACITY), size=n, p=[0.40, 0.22, 0.18, 0.08, 0.12])
     insurance = rng.choice(INSURANCE_GROUPS, size=n, p=INSURANCE_SHARES)
     age = _ages_for_insurance(insurance, rng)
-    los = rng.integers(1, 15, size=n)
-    day_of_week = rng.integers(0, 7, size=n)  # 0 = Monday
 
-    medical = (rng.random(n) < 0.40).astype(int)
-    social_p = np.where(np.isin(insurance, ["Medicaid", "Uninsured"]), 0.50, 0.15)
+    expected_los = rng.integers(2, 7, size=n)
+    los = np.maximum(1, expected_los + rng.integers(-3, 6, size=n))
+    days_past = los - expected_los
+
+    pending_test = (rng.random(n) < 0.25).astype(int)
+    iv_meds = (rng.random(n) < 0.22).astype(int)
+    older = age >= 75
+    mobility = np.where(
+        older,
+        rng.choice(MOBILITY_LEVELS, size=n, p=[0.50, 0.32, 0.18]),
+        rng.choice(MOBILITY_LEVELS, size=n, p=[0.75, 0.18, 0.07]),
+    )
+    social_p = np.where(np.isin(insurance, ["Medicaid", "Uninsured"]), 0.45, 0.15)
     social = (rng.random(n) < social_p).astype(int)
 
-    unit_effect = pd.Series(units).map(
-        {"Medicine": 0.0, "Surgery": 0.2, "Telemetry": 0.1, "ICU": -1.5, "Women's & Peds": 0.6}
-    ).to_numpy()
+    limited = (mobility != "Independent").astype(int)
+    physician_noted = (
+        rng.random(n)
+        < _sigmoid(-0.4 - 1.8 * pending_test - 1.8 * iv_meds - 0.9 * limited + 0.25 * np.clip(days_past, -3, 3))
+    ).astype(int)
+
     logit = (
-        -0.9
-        + 0.18 * np.minimum(los, 7)
-        - 1.7 * medical
-        - 1.2 * social
-        - 0.6 * (day_of_week >= 5)
-        - 0.012 * np.maximum(age - 65, 0)
-        + unit_effect
+        -1.5
+        + 0.30 * np.clip(days_past, -3, 4)
+        - 1.2 * pending_test
+        - 1.3 * iv_meds
+        - 0.7 * (mobility == "Needs assistance")
+        - 1.8 * (mobility == "Bedbound")
+        + 2.2 * physician_noted
+        - 1.4 * social
     )
     discharged = (rng.random(n) < _sigmoid(logit)).astype(int)
 
@@ -381,12 +434,15 @@ def generate_past_inpatient_stays(n: int = 3000) -> pd.DataFrame:
             "stay_id": [f"S{500000 + i}" for i in range(n)],
             "unit": units,
             "age": age,
-            "insurance": insurance,
+            "insurance": insurance,  # fairness checks only
             "los_days": los,
-            "day_of_week": day_of_week,
-            "is_weekend": (day_of_week >= 5).astype(int),
-            "has_medical_barrier": medical,
-            "has_social_barrier": social,
+            "expected_los_days": expected_los,
+            "days_past_expected": days_past,
+            "pending_test": pending_test,
+            "iv_meds": iv_meds,
+            "mobility": mobility,
+            "physician_noted_dc_today": physician_noted,
+            "social_barrier": social,
             "discharged_that_day": discharged,
         }
     )
@@ -432,6 +488,198 @@ def boarding_gap_by_insurance(boarding: pd.DataFrame) -> pd.DataFrame:
     out["mean_minutes"] = out["mean_minutes"].round(1)
     out["vs_overall_minutes"] = (out["mean_minutes"] - overall).round(1)
     return out
+
+
+# ---------------------------------------------------------------------------
+# Explainable models (logistic regression)
+# ---------------------------------------------------------------------------
+
+# Never allowed as model inputs. Age as a clinical number is allowed; the
+# binned `age_group` is not.
+FORBIDDEN_MODEL_INPUTS = frozenset({"insurance", *FAIRNESS_ONLY_COLUMNS})
+
+
+@dataclass(frozen=True)
+class Feature:
+    name: str
+    kind: str  # "numeric" | "binary" | "categorical"
+    categories: tuple = ()
+
+
+class ExplainableLogit:
+    """Logistic regression on standardized inputs, with per-patient reasons.
+
+    A feature's contribution is coefficient x standardized value: how far it
+    moves this patient's log-odds compared with the average training patient.
+    One-hot columns are summed back into their original feature.
+    """
+
+    def __init__(self, features: list[Feature], target: str, labeler):
+        names = {f.name for f in features}
+        forbidden = names & FORBIDDEN_MODEL_INPUTS
+        if forbidden:
+            raise ValueError(f"Not allowed as model inputs: {sorted(forbidden)}")
+        self.features = features
+        self.target = target
+        self.labeler = labeler
+
+    def _encode(self, df: pd.DataFrame) -> pd.DataFrame:
+        cols = {}
+        for f in self.features:
+            if f.kind == "categorical":
+                for c in f.categories:
+                    cols[f"{f.name}={c}"] = (df[f.name] == c).astype(float)
+            else:
+                cols[f.name] = df[f.name].astype(float)
+        return pd.DataFrame(cols, index=df.index)
+
+    def fit(self, df: pd.DataFrame) -> "ExplainableLogit":
+        X, y = self._encode(df), df[self.target]
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.25, random_state=SEED, stratify=y
+        )
+        self.pipeline = make_pipeline(StandardScaler(), LogisticRegression(max_iter=2000))
+        self.pipeline.fit(X_train, y_train)
+        self.auc = float(roc_auc_score(y_test, self.pipeline.predict_proba(X_test)[:, 1]))
+        self.n_train, self.n_test = len(X_train), len(X_test)
+        return self
+
+    def predict_proba(self, df: pd.DataFrame) -> np.ndarray:
+        return self.pipeline.predict_proba(self._encode(df))[:, 1]
+
+    def contributions(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Log-odds contribution of each original feature, per row."""
+        X = self._encode(df)
+        scaler = self.pipeline.named_steps["standardscaler"]
+        coef = self.pipeline.named_steps["logisticregression"].coef_[0]
+        contrib = pd.DataFrame(scaler.transform(X) * coef, index=df.index, columns=X.columns)
+        groups = [c.split("=")[0] for c in X.columns]
+        return contrib.T.groupby(groups, sort=False).sum().T
+
+    def reasons(self, df: pd.DataFrame, n: int = 3, direction: int = 1, min_effect: float = 0.05):
+        """Top-n readable reasons per row. direction=1 pushes the score up, -1 down."""
+        contrib = self.contributions(df) * direction
+        out = []
+        for idx, row in contrib.iterrows():
+            top = row[row > min_effect].sort_values(ascending=False).head(n)
+            out.append([self.labeler(f, df.at[idx, f]) for f in top.index])
+        return out
+
+    def coefficients(self) -> pd.DataFrame:
+        coef = self.pipeline.named_steps["logisticregression"].coef_[0]
+        cols = self._encode(pd.DataFrame({f.name: [0] for f in self.features})).columns
+        return (
+            pd.DataFrame({"input": cols, "coefficient_per_sd": coef.round(3)})
+            .sort_values("coefficient_per_sd", key=abs, ascending=False)
+            .reset_index(drop=True)
+        )
+
+
+# ----- Admission at triage ------------------------------------------------
+
+ADMISSION_FEATURES = [
+    Feature("age", "numeric"),
+    Feature("triage_acuity", "categorical", (1, 2, 3, 4, 5)),
+    Feature("heart_rate", "numeric"),
+    Feature("o2_sat", "numeric"),
+    Feature("temperature_c", "numeric"),
+    Feature("systolic_bp", "numeric"),
+    Feature("diastolic_bp", "numeric"),
+    Feature("chief_complaint", "categorical", tuple(CHIEF_COMPLAINTS)),
+    Feature("cardiac_history", "binary"),
+    Feature("prior_visits_12mo", "numeric"),
+]
+assert [f.name for f in ADMISSION_FEATURES] == ED_MODEL_FEATURES
+
+
+def _admission_label(feature: str, value) -> str:
+    return {
+        "age": lambda v: f"Age {v}",
+        "triage_acuity": lambda v: f"Triage acuity {v}",
+        "heart_rate": lambda v: f"Heart rate {v}",
+        "o2_sat": lambda v: f"O₂ sat {v}%",
+        "temperature_c": lambda v: f"Temp {v}°C",
+        "systolic_bp": lambda v: f"Systolic BP {v}",
+        "diastolic_bp": lambda v: f"Diastolic BP {v}",
+        "chief_complaint": lambda v: f"Complaint: {v.lower()}",
+        "cardiac_history": lambda v: "Cardiac history" if v else "No cardiac history",
+        "prior_visits_12mo": lambda v: f"{v} ED visit(s) in past year",
+    }[feature](value)
+
+
+def train_admission_model(ed_visits: pd.DataFrame) -> ExplainableLogit:
+    return ExplainableLogit(ADMISSION_FEATURES, "admitted", _admission_label).fit(ed_visits)
+
+
+def predict_bed_type(row) -> tuple[str, str]:
+    """Rule-based likely bed type, returned with the rule that fired."""
+    icu = []
+    if row["triage_acuity"] == 1:
+        icu.append("acuity 1")
+    if row["o2_sat"] < 89:
+        icu.append(f"O₂ {row['o2_sat']}% (<89)")
+    if row["systolic_bp"] < 90:
+        icu.append(f"SBP {row['systolic_bp']} (<90)")
+    if icu:
+        return "ICU", ", ".join(icu)
+    if row["chief_complaint"] == "Chest pain":
+        return "Telemetry", "chest pain"
+    if row["cardiac_history"] and row["heart_rate"] > 105:
+        return "Telemetry", f"cardiac history + HR {row['heart_rate']} (>105)"
+    if row["chief_complaint"] in ("Abdominal pain", "Fall / injury"):
+        return "Surgery", row["chief_complaint"].lower()
+    return "Medicine", "no ICU, telemetry, or surgery criteria"
+
+
+def score_current_ed(model: ExplainableLogit, ed_current: pd.DataFrame) -> pd.DataFrame:
+    out = ed_current.copy()
+    out["admit_probability"] = model.predict_proba(out)
+    out["top_reasons"] = ["; ".join(r) for r in model.reasons(out, n=3, direction=1)]
+    beds = out.apply(predict_bed_type, axis=1, result_type="expand")
+    out["likely_bed"], out["bed_rule"] = beds[0], beds[1]
+    return out
+
+
+# ----- Likely to go home today -------------------------------------------
+
+DISCHARGE_FEATURES = [
+    Feature("days_past_expected", "numeric"),
+    Feature("pending_test", "binary"),
+    Feature("iv_meds", "binary"),
+    Feature("mobility", "categorical", tuple(MOBILITY_LEVELS)),
+    Feature("physician_noted_dc_today", "binary"),
+    Feature("social_barrier", "binary"),
+]
+
+
+def _discharge_label(feature: str, value) -> str:
+    if feature == "days_past_expected":
+        v = int(value)
+        if v > 0:
+            return f"{v} day(s) past expected stay"
+        if v < 0:
+            return f"{-v} day(s) before expected discharge"
+        return "At expected length of stay"
+    return {
+        "pending_test": lambda v: "Test still pending" if v else "No pending tests",
+        "iv_meds": lambda v: "On IV medications" if v else "No IV medications",
+        "mobility": lambda v: f"Mobility: {v.lower()}",
+        "physician_noted_dc_today": lambda v: "MD noted likely discharge today" if v else "No MD discharge note",
+        "social_barrier": lambda v: "Documented social barrier" if v else "No social barrier documented",
+    }[feature](value)
+
+
+def train_discharge_model(past_stays: pd.DataFrame) -> ExplainableLogit:
+    return ExplainableLogit(DISCHARGE_FEATURES, "discharged_that_day", _discharge_label).fit(past_stays)
+
+
+def rank_inpatients(model: ExplainableLogit, inpatients: pd.DataFrame) -> pd.DataFrame:
+    """Current inpatients sorted by probability of going home today."""
+    out = inpatients.copy()
+    out["discharge_probability"] = model.predict_proba(out)
+    out["reasons_for"] = ["; ".join(r) for r in model.reasons(out, n=3, direction=1)]
+    out["reasons_against"] = ["; ".join(r) for r in model.reasons(out, n=3, direction=-1)]
+    return out.sort_values("discharge_probability", ascending=False).reset_index(drop=True)
 
 
 # ---------------------------------------------------------------------------
