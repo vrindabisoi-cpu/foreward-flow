@@ -16,12 +16,21 @@ A staff-facing Streamlit dashboard for **emergency department (ED) patient flow 
 - **Public health & news alerts** (simulated).
 - **Decision log** of every decision, with time, role, and reason. It can be downloaded as a CSV.
 
-### Patient flow tab
+### ED Admissions tab
 
-- **Bed status** for five inpatient units: open, needs cleaning, and occupied beds, plus occupancy %.
-- **ED admission prediction.** For each patient in the ED: the probability of admission, the top 3 reasons pushing that score up, and a likely bed type.
-- **Likely to go home today.** Current inpatients ranked by their chance of discharge today, with the top reasons for it and the main barriers against it.
-- **Model performance** in the sidebar: both models' AUC, tested on held-out synthetic data.
+- One card per ED patient: age, chief complaint, triage acuity, vitals, admit probability (progress bar), the top 3 reasons, likely bed type and the bed rule that fired, and hours boarding (red over 2 hours).
+- **Physician confirms level of care · Bed manager assigns room.** Only the **Physician** or **Bed manager** role can **Accept** the AI bed type or **Override** it.
+- An override needs a corrected bed type (Medicine, Telemetry, Surgery, ICU, Women's & Peds, Not admitting) and a reason (different level of care, isolation needed, likely discharge, room constraint, other). "Other" also needs a note.
+- Every decision goes to the decision log with time, role, and reason.
+
+### Barrier Flags tab
+
+- Inpatients ranked by **likely to go home today**, with probability and top reasons.
+- **Scan notes with AI** sends each note to the Claude API (official `anthropic` Python SDK, `POST /v1/messages`, structured JSON output). Claude returns each barrier tagged **Medical** or **Social** with a suggested owner team (Social work, Case management, Pharmacy, Hospitalist). It is told not to make clinical decisions, and only the note text is sent, never insurance or demographics.
+- **API key:** entered in the sidebar password box or set as `ANTHROPIC_API_KEY`. It is never hard-coded, saved, or logged. The model name is editable in the sidebar; the default is `claude-opus-5-5`. Server-side refusal fallback is on for models that support it.
+- **Offline fallback:** with no key, or for any note whose call fails, keyword rules flag the barriers instead. The page always says which source was used ("Claude API" or "Offline fallback") and why.
+- Totals at the top, orange **Social** and blue **Medical** flags per patient, the note in an expander, and an **Assign to [owner team]** button. Only the **Case manager** or **Social worker** role can assign; each assignment is logged with the barrier text.
+- A bar chart shows the % of scanned patients with a social barrier by insurance group. Help is routed by documented need, never by insurance type.
 
 ### What-If tab
 
@@ -35,7 +44,9 @@ Choose how many hours less each admitted patient boards in the ED. Earlier disch
 | ED room-hours freed | 13,600 | 10,200 | 13,600 × hours |
 | Patients roomed sooner | 4,124 | 3,093 | room-hours × 0.303 patients/room-hour (233 arrivals/day ÷ 32 rooms ÷ 24 h) |
 | Recovered visits (estimate) | 165 | 124 | patients roomed sooner × 4% LWBS rate |
-| **Value line 2 — Recovered net revenue (estimate)** | $247,432 | $185,574 | recovered visits × $1,500 |
+| **Value line 2 — Conservative estimate (freed ED rooms only)** | ≈ $250,000 | ≈ $190,000 | recovered visits × $1,500, rounded to the nearest $10K |
+
+**Upper estimate:** If the Month-18 goal is met (LWBS 4.0% → 2.8%): 85,000 × 1.2% = 1,020 visits × $1,500 ≈ $1.53M/yr.
 
 **Today** uses the 6 current boarders: each leaves up to the slider value sooner, never more than they actually boarded. Value line 2 is labelled in the app as an estimate, not a forecast.
 
@@ -160,5 +171,5 @@ Then open http://localhost:8501.
 ```
 app.py            Streamlit UI
 flow_engine.py    Synthetic data, models, bed-type rules, and bed forecast
-requirements.txt  streamlit, pandas, numpy, scikit-learn
+requirements.txt  streamlit, pandas, numpy, scikit-learn, anthropic
 ```

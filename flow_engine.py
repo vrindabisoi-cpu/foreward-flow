@@ -11,7 +11,10 @@ or changing one dataset never shifts the values of another.
 from __future__ import annotations
 
 import csv
+import json
 import os
+import re
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -1138,6 +1141,7 @@ def ed_room_status(ed_scored: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 LWBS_RATE = 0.04  # case brief: 4% of ED patients leave without being seen
+LWBS_GOAL_RATE = 0.028  # case brief Month-18 goal: 4.0% -> 2.8%
 NET_REVENUE_PER_VISIT = 1_500  # case brief: average net revenue per ED visit
 # Patients one ED treatment room serves per hour on an average day.
 PATIENTS_PER_ROOM_HOUR = (ED_ARRIVALS_PER_YEAR / 365) / (ED_ROOM_CAPACITY["Treatment rooms"] * 24)
@@ -1187,6 +1191,204 @@ def what_if_beds_earlier(hours_earlier: float, ed_scored: pd.DataFrame) -> dict:
     year_lines = _value_lines(ANNUAL_ADMISSIONS * per_admission)
     year_lines["hours_per_admission"] = per_admission
     return {"today": today_lines, "per_year": year_lines}
+
+
+def upper_lwbs_estimate() -> dict:
+    """If the Month-18 LWBS goal is met: 85,000 x (4.0% - 2.8%) visits x $1,500."""
+    visits = ED_ARRIVALS_PER_YEAR * (LWBS_RATE - LWBS_GOAL_RATE)
+    return {"visits": visits, "revenue": visits * NET_REVENUE_PER_VISIT}
+
+
+# ---------------------------------------------------------------------------
+# Barrier flags: read notes with Claude, with an offline keyword fallback
+# ---------------------------------------------------------------------------
+
+BARRIER_TYPES = ["Medical", "Social"]
+BARRIER_OWNERS = ["Social work", "Case management", "Pharmacy", "Hospitalist"]
+DEFAULT_CLAUDE_MODEL = "claude-opus-5-5"
+# Models that accept server-side refusal fallbacks (fallbacks="default").
+_FALLBACK_MODELS = {"claude-fable-5-2", "claude-fable-5-1", "claude-opus-5-5", "claude-opus-5", "claude-sonnet-5-5"}
+SOURCE_CLAUDE = "Claude API"
+SOURCE_OFFLINE = "Offline fallback"
+
+BARRIER_SYSTEM_PROMPT = """You read short synthetic inpatient notes for a hospital capacity dashboard and list the discharge barriers each note documents.
+
+For each barrier the note explicitly documents:
+- Write a short phrase describing it, using the note's own facts.
+- Tag it "Medical" for clinical items still pending (tests, IV medications, therapy evaluations, consults, limited mobility) or "Social" for non-clinical items (transportation, medication cost, placement, housing, insurance authorization, family or caregiver availability).
+- Suggest one owner team: Social work, Case management, Pharmacy, or Hospitalist.
+
+You are not making clinical decisions. Do not recommend treatments, diagnoses, discharge timing, or levels of care, and do not judge whether the patient is ready to leave. A team member reviews every flag. Do not infer barriers the note does not state; a note that documents none gets an empty list."""
+
+BARRIER_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "barriers": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "barrier": {"type": "string"},
+                    "type": {"type": "string", "enum": BARRIER_TYPES},
+                    "owner": {"type": "string", "enum": BARRIER_OWNERS},
+                },
+                "required": ["barrier", "type", "owner"],
+                "additionalProperties": False,
+            },
+        }
+    },
+    "required": ["barriers"],
+    "additionalProperties": False,
+}
+
+# Offline fallback: (pattern, barrier, type, owner)
+_KEYWORD_RULES = [
+    (r"MRI\b.*pending", "MRI pending", "Medical", "Hospitalist"),
+    (r"\b[Ee]cho\b.*pending", "Echo read pending", "Medical", "Hospitalist"),
+    (r"(labs|cultures).*pending", "Labs/cultures pending", "Medical", "Hospitalist"),
+    (r"IV antibiotics", "On IV antibiotics, awaiting oral switch", "Medical", "Pharmacy"),
+    (r"PT eval not yet completed", "PT evaluation not completed", "Medical", "Hospitalist"),
+    (r"walker and 1 assist", "Needs assistance to walk", "Medical", "Case management"),
+    (r"[Bb]edbound", "Bedbound, 2-person assist", "Medical", "Case management"),
+    (r"no ride home", "No ride home", "Social", "Case management"),
+    (r"can't afford", "Can't afford discharge medications", "Social", "Pharmacy"),
+    (r"nursing-home placement", "Needs nursing-home placement", "Social", "Case management"),
+    (r"shelter", "Staying at a shelter; needs a safe discharge plan", "Social", "Social work"),
+    (r"[Ii]nsurance authorization pending", "Insurance authorization pending", "Social", "Case management"),
+]
+
+
+def offline_barriers(note: str) -> list[dict]:
+    return [
+        {"barrier": text, "type": kind, "owner": owner}
+        for pattern, text, kind, owner in _KEYWORD_RULES
+        if re.search(pattern, note)
+    ]
+
+
+def _validated(barriers) -> list[dict]:
+    out = []
+    for b in barriers if isinstance(barriers, list) else []:
+        if (
+            isinstance(b, dict)
+            and b.get("type") in BARRIER_TYPES
+            and b.get("owner") in BARRIER_OWNERS
+            and str(b.get("barrier", "")).strip()
+        ):
+            out.append({"barrier": str(b["barrier"]).strip(), "type": b["type"], "owner": b["owner"]})
+    return out
+
+
+def claude_barriers(client, model: str, note: str) -> list[dict]:
+    """One note -> barriers, via the Claude Messages API (structured JSON output)."""
+    params = dict(
+        model=model,
+        max_tokens=2000,
+        system=BARRIER_SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": f"<note>\n{note}\n</note>"}],
+        output_config={"format": {"type": "json_schema", "schema": BARRIER_SCHEMA}},
+    )
+    if model in _FALLBACK_MODELS:
+        # Server-side refusal fallback: if this model declines, another model answers.
+        response = client.beta.messages.create(
+            betas=["server-side-fallback-2026-07-01"], fallbacks="default", **params
+        )
+    else:
+        response = client.messages.create(**params)
+    if response.stop_reason == "refusal":
+        raise RuntimeError("Model declined to read this note")
+    if response.stop_reason == "max_tokens":
+        raise RuntimeError("Response was cut off")
+    text = next((b.text for b in response.content if b.type == "text"), "")
+    return _validated(json.loads(text).get("barriers"))
+
+
+def _describe_error(exc: Exception) -> str:
+    """Short, key-free error label for the UI."""
+    import anthropic
+
+    if isinstance(exc, anthropic.AuthenticationError):
+        return "API key was rejected (401)"
+    if isinstance(exc, anthropic.PermissionDeniedError):
+        return "API key lacks permission (403)"
+    if isinstance(exc, anthropic.NotFoundError):
+        return "Model not found (404); check the model name"
+    if isinstance(exc, anthropic.RateLimitError):
+        return "Rate limited (429)"
+    if isinstance(exc, anthropic.BadRequestError):
+        return "Request rejected (400)"
+    if isinstance(exc, anthropic.APIStatusError):
+        return f"API error ({exc.status_code})"
+    if isinstance(exc, anthropic.APIConnectionError):
+        return "Could not reach the Claude API"
+    if isinstance(exc, json.JSONDecodeError):
+        return "Response was not valid JSON"
+    return str(exc) or type(exc).__name__
+
+
+def scan_notes(inpatients: pd.DataFrame, api_key: str | None, model: str, client=None) -> dict:
+    """Scan every note. Uses Claude when a key is given; any note whose call
+    fails (or every note, with no key) uses the offline keyword fallback.
+
+    The API key is only passed to the SDK client. It is never stored,
+    returned, or written to the decision log.
+    """
+    notes = dict(zip(inpatients["patient_id"], inpatients["nurse_note"]))
+    results, errors = {}, []
+
+    if api_key or client is not None:
+        if client is None:
+            import anthropic
+
+            client = anthropic.Anthropic(api_key=api_key, max_retries=2, timeout=60)
+
+        def one(item):
+            pid, note = item
+            try:
+                return pid, claude_barriers(client, model, note), None
+            except Exception as exc:  # fall back per note; keep the reason
+                return pid, None, _describe_error(exc)
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            for pid, barriers, err in pool.map(one, notes.items()):
+                if err is None:
+                    results[pid] = {"source": SOURCE_CLAUDE, "barriers": barriers}
+                else:
+                    errors.append(err)
+                    results[pid] = {"source": SOURCE_OFFLINE, "barriers": offline_barriers(notes[pid]), "error": err}
+    else:
+        for pid, note in notes.items():
+            results[pid] = {"source": SOURCE_OFFLINE, "barriers": offline_barriers(note), "error": "No API key"}
+
+    n_claude = sum(r["source"] == SOURCE_CLAUDE for r in results.values())
+    return {
+        "results": results,
+        "model": model,
+        "n_claude": n_claude,
+        "n_offline": len(results) - n_claude,
+        "errors": sorted(set(errors)),
+    }
+
+
+def barrier_summary(inpatients: pd.DataFrame, scan: dict) -> pd.DataFrame:
+    """One row per scanned patient with social/medical flags (for totals and the chart)."""
+    rows = []
+    for pid, ins in zip(inpatients["patient_id"], inpatients["insurance"]):
+        r = scan["results"].get(pid)
+        if r is None:
+            continue
+        kinds = {b["type"] for b in r["barriers"]}
+        rows.append({"patient_id": pid, "insurance": ins,
+                     "social": "Social" in kinds, "medical": "Medical" in kinds})
+    return pd.DataFrame(rows)
+
+
+def social_barrier_by_insurance(summary: pd.DataFrame) -> pd.DataFrame:
+    """% of scanned patients with a social barrier, by insurance group (display only)."""
+    g = summary.groupby("insurance").agg(patients=("social", "size"), with_social=("social", "sum"))
+    g = g.reindex([i for i in INSURANCE_GROUPS if i in g.index]).reset_index()
+    g["pct_social"] = (100 * g["with_social"] / g["patients"]).round(0)
+    return g
 
 
 # ---------------------------------------------------------------------------

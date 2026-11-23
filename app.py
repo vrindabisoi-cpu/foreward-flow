@@ -5,6 +5,8 @@ Uses SYNTHETIC data only (see flow_engine.py).
 
 from datetime import datetime
 
+import os
+
 import altair as alt
 import pandas as pd
 import streamlit as st
@@ -14,7 +16,18 @@ import flow_engine as fe
 st.set_page_config(page_title="ForeWard Flow — Halvian Medical Center", layout="wide")
 
 DECISION_OWNER = "House supervisor"
-ROLES = [DECISION_OWNER, "Charge nurse", "Bed manager", "ED physician"]
+ROLES = [DECISION_OWNER, "Charge nurse", "Bed manager", "Physician", "Case manager", "Social worker"]
+PLACEMENT_ROLES = ["Physician", "Bed manager"]  # accept/override AI bed type
+ASSIGN_ROLES = ["Case manager", "Social worker"]  # assign barrier flags
+OVERRIDE_BED_TYPES = ["Medicine", "Telemetry", "Surgery", "ICU", "Women's & Peds", "Not admitting"]
+OVERRIDE_REASONS = [
+    "Physician determined different level of care",
+    "Isolation needed",
+    "Likely discharge",
+    "Room constraint",
+    "Other",
+]
+SOCIAL_ORANGE = "#e07b39"
 SERIES_BLUE = "#2a78d6"
 CRITICAL_RED = "#d03b3b"
 
@@ -84,6 +97,48 @@ def alert_status(log, alert):
     return rows["decision"].iloc[-1] if len(rows) else "Pending review"
 
 
+def _now():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def accept_bed(role, pid, bed, rule):
+    fe.append_decision({"time": _now(), "role": role, "decision": "Accepted",
+                        "item": f"{pid} bed type: {bed}", "context": "ED Admissions",
+                        "reason": f"AI bed type confirmed (rule: {rule})"})
+
+
+def override_bed(role, pid, ai_bed):
+    new_bed = st.session_state.get(f"ov_bed_{pid}")
+    reason = st.session_state.get(f"ov_reason_{pid}")
+    note = st.session_state.get(f"ov_note_{pid}", "").strip()
+    if not new_bed or not reason:
+        st.session_state["flash"] = f"{pid}: choose a corrected bed type and a reason to override."
+        return
+    if reason == "Other" and not note:
+        st.session_state["flash"] = f"{pid}: add a note when the reason is Other."
+        return
+    fe.append_decision({"time": _now(), "role": role, "decision": "Overridden",
+                        "item": f"{pid} bed type: {ai_bed} → {new_bed}", "context": "ED Admissions",
+                        "reason": reason + (f": {note}" if note else "")})
+    for k in (f"ov_bed_{pid}", f"ov_reason_{pid}"):
+        st.session_state[k] = None
+    st.session_state[f"ov_note_{pid}"] = ""
+
+
+def assign_barrier(role, pid, barrier, source):
+    fe.append_decision({"time": _now(), "role": role, "decision": "Assigned",
+                        "item": f"{pid}: {barrier['barrier']}", "context": "Barrier Flags",
+                        "reason": f"Routed to {barrier['owner']} ({barrier['type']} barrier; flagged by {source})"})
+
+
+def run_scan():
+    # The key is read here and passed straight to the SDK; it is never stored or logged.
+    key = st.session_state.get("api_key_input") or os.environ.get("ANTHROPIC_API_KEY")
+    model = st.session_state.get("claude_model") or fe.DEFAULT_CLAUDE_MODEL
+    with st.spinner("Scanning notes..."):
+        st.session_state["barrier_scan"] = fe.scan_notes(ranked, key, model)
+
+
 decision_log = fe.read_decision_log()
 
 
@@ -107,6 +162,8 @@ with st.sidebar:
     st.header("Your role")
     role = st.selectbox("Acting as", ROLES, index=0)
     is_owner = role == DECISION_OWNER
+    can_place = role in PLACEMENT_ROLES
+    can_assign = role in ASSIGN_ROLES
     if not is_owner:
         st.caption(f"View only. Decisions belong to the {DECISION_OWNER.lower()}.")
 
@@ -133,6 +190,20 @@ with st.sidebar:
     st.caption(f"{staffing['shift']} · context only, not used in any calculation")
     st.markdown("\n".join(f"- {n} {role}" for role, n in staffing["staff"].items()))
 
+    st.header("Claude API (Barrier Flags)")
+    st.text_input("Anthropic API key", type="password", key="api_key_input",
+                  help="Or set the ANTHROPIC_API_KEY environment variable. Never saved or logged.")
+    st.text_input("Model", value=fe.DEFAULT_CLAUDE_MODEL, key="claude_model")
+    if st.session_state.get("api_key_input"):
+        key_source = "sidebar"
+    elif os.environ.get("ANTHROPIC_API_KEY"):
+        key_source = "environment"
+    else:
+        key_source = None
+    api_key = bool(key_source)
+    model_name = st.session_state.get("claude_model") or fe.DEFAULT_CLAUDE_MODEL
+    st.caption(f"Key: {key_source or 'none — notes use the offline fallback'}")
+
     st.header("Data sources")
     st.caption(fe.DATA_SOURCES_NOTE)
 
@@ -152,7 +223,9 @@ st.caption("Synthetic data only — not real patients")
 if "flash" in st.session_state:
     st.error(st.session_state.pop("flash"))
 
-tab_control, tab_flow, tab_whatif, tab_equity = st.tabs(["AI Control Center", "Patient flow", "What-If", "Equity"])
+tab_control, tab_ed, tab_barriers, tab_whatif, tab_equity = st.tabs(
+    ["AI Control Center", "ED Admissions", "Barrier Flags", "What-If", "Equity"]
+)
 
 # =====================================================================================
 # AI Control Center
@@ -413,103 +486,154 @@ with tab_control:
     )
 
 # =====================================================================================
-# Patient flow: ED predictions and discharge list
+# ED Admissions: AI admit prediction + bed type, confirmed by people
 # =====================================================================================
-with tab_flow:
-    st.subheader("ED patients — admission prediction")
+with tab_ed:
+    st.subheader("ED Admissions")
     boarding = ed[ed["status"] == "Boarding"]
     c1, c2, c3 = st.columns(3)
     c1.metric("Patients in ED", len(ed))
     c2.metric("Boarding (admitted, no bed)", len(boarding))
     c3.metric("Longest boarding", f"{boarding['hours_boarding'].max():.1f} h")
+    st.info("**Physician confirms level of care · Bed manager assigns room.** "
+            "The AI suggests; people decide.", icon="🩺")
+    if not can_place:
+        st.caption(f"Acting as {role}: view only. Only {' or '.join(PLACEMENT_ROLES)} can accept or override.")
 
-    st.dataframe(
-        ed[
-            [
-                "patient_id", "bed", "status", "age", "triage_acuity", "chief_complaint",
-                "admit_probability", "top_reasons", "likely_bed", "bed_rule",
-                "admit_unit", "hours_boarding",
-            ]
-        ],
-        hide_index=True,
-        width="stretch",
-        column_config={
-            "patient_id": "Patient",
-            "bed": "ED bed",
-            "status": "Status",
-            "age": "Age",
-            "triage_acuity": "Acuity",
-            "chief_complaint": "Chief complaint",
-            "admit_probability": st.column_config.ProgressColumn(
-                "Admit probability", min_value=0.0, max_value=1.0, format="percent"
-            ),
-            "top_reasons": st.column_config.TextColumn("Top reasons pushing score up", width="large"),
-            "likely_bed": "Likely bed type",
-            "bed_rule": "Bed rule",
-            "admit_unit": "Admitted to",
-            "hours_boarding": st.column_config.NumberColumn("Hours boarding", format="%.1f"),
-        },
-    )
-    st.caption(
-        "Reasons are compared with the average ED patient in the training data. "
-        "Likely bed type uses fixed rules, checked in order: Women's & Peds if age < 18; "
-        "ICU if acuity 1, O₂ < 89%, or systolic BP < 90; "
-        "Telemetry for chest pain, or cardiac history with HR > 105; "
-        "Surgery for abdominal pain or fall/injury; otherwise Medicine."
-    )
+    ed_log = decision_log[decision_log["context"] == "ED Admissions"]
 
-    st.subheader("Inpatients — likely to go home today")
-    ranked_view = ranked.copy()
-    ranked_view.insert(0, "rank", range(1, len(ranked_view) + 1))
-    c1, c2 = st.columns(2)
-    c1.metric("Inpatients listed", len(ranked_view))
-    c2.metric(
-        "Expected discharges today (sum of probabilities)",
-        f"{ranked_view['discharge_probability'].sum():.1f}",
-    )
-    st.dataframe(
-        ranked_view[
-            [
-                "rank", "patient_id", "unit", "room", "los_days", "discharge_probability",
-                "reasons_for", "reasons_against", "nurse_note",
-            ]
-        ],
-        hide_index=True,
-        width="stretch",
-        column_config={
-            "rank": "#",
-            "patient_id": "Patient",
-            "unit": "Unit",
-            "room": "Room",
-            "los_days": "Days in hospital",
-            "discharge_probability": st.column_config.ProgressColumn(
-                "Home-today probability", min_value=0.0, max_value=1.0, format="percent"
-            ),
-            "reasons_for": st.column_config.TextColumn("Top reasons for", width="medium"),
-            "reasons_against": st.column_config.TextColumn("Top barriers", width="medium"),
-            "nurse_note": st.column_config.TextColumn("Nurse note", width="large"),
-        },
-    )
-    st.caption(
-        "Model inputs: days past expected stay, pending test, IV meds, mobility, "
-        "physician-noted likely discharge, and documented social barrier."
-    )
+    def place_status(pid):
+        rows = ed_log[ed_log["item"].str.startswith(f"{pid} ")]
+        return rows.iloc[-1] if len(rows) else None
 
-    with st.expander("Bed status table"):
-        st.dataframe(
-            beds.rename(
-                columns={
-                    "unit": "Unit",
-                    "total_beds": "Total",
-                    "open": "Open",
-                    "needs_cleaning": "Needs cleaning",
-                    "occupied": "Occupied",
-                    "occupancy_pct": "Occupancy %",
-                }
-            ),
-            hide_index=True,
-            width="stretch",
+    for row in ed.itertuples():
+        pid = row.patient_id
+        with st.container(border=True):
+            info, model_col, bed_col = st.columns([3, 3, 3])
+            with info:
+                st.markdown(f"**{pid}** · {row.bed} · {row.status}")
+                st.markdown(f"Age **{row.age}** · {row.chief_complaint} · Triage acuity **{row.triage_acuity}**")
+                st.caption(
+                    f"HR {row.heart_rate} · O₂ {row.o2_sat}% · Temp {row.temperature_c}°C · "
+                    f"BP {row.systolic_bp}/{row.diastolic_bp}"
+                )
+                if row.status == "Boarding":
+                    hours = f"{row.hours_boarding:.1f} h boarding"
+                    st.markdown(f":red[**{hours}**]" if row.hours_boarding > 2 else f"**{hours}**")
+                else:
+                    st.caption(f"In workup · {row.hours_in_ed:.1f} h in ED")
+            with model_col:
+                st.progress(float(row.admit_probability), text=f"Admit probability: **{row.admit_probability:.0%}**")
+                reasons = [r for r in row.top_reasons.split("; ") if r]
+                st.markdown("Top reasons:\n" + "\n".join(f"- {r}" for r in reasons) if reasons else "No strong reasons")
+            with bed_col:
+                st.markdown(f"Likely bed type: **{row.likely_bed}**")
+                st.caption(f"Bed rule: {row.bed_rule}")
+                last = place_status(pid)
+                if last is not None:
+                    mark = "✅" if last["decision"] == "Accepted" else "✏️"
+                    st.markdown(f"{mark} **{last['decision']}** by {last['role']} · {last['time'][11:16]}")
+                    st.caption(f"{last['item'].split(': ', 1)[-1]} · {last['reason']}")
+                b1, b2 = st.columns(2)
+                b1.button("Accept", key=f"accept_{pid}", type="primary", disabled=not can_place,
+                          on_click=accept_bed, args=(role, pid, row.likely_bed, row.bed_rule), width="stretch")
+                with b2.popover("Override", disabled=not can_place, width="stretch"):
+                    st.selectbox("Corrected bed type", OVERRIDE_BED_TYPES, key=f"ov_bed_{pid}",
+                                 index=None, placeholder="Choose bed type")
+                    st.selectbox("Reason", OVERRIDE_REASONS, key=f"ov_reason_{pid}",
+                                 index=None, placeholder="Choose reason")
+                    st.text_input("Note (required for Other)", key=f"ov_note_{pid}")
+                    st.button("Submit override", key=f"ov_submit_{pid}", type="primary",
+                              on_click=override_bed, args=(role, pid, row.likely_bed))
+
+
+# =====================================================================================
+# Barrier Flags: likely-home-today list + note scanning
+# =====================================================================================
+with tab_barriers:
+    st.subheader("Barrier Flags")
+    st.caption("Inpatients ranked by how likely they are to go home today. "
+               "Scan the notes to flag what is holding each discharge up.")
+    if not can_assign:
+        st.caption(f"Acting as {role}: view only. Only {' or '.join(ASSIGN_ROLES)} can assign barriers.")
+
+    scan_col, info_col = st.columns([1, 3])
+    scan_col.button("Scan notes with AI", key="scan_notes", type="primary", on_click=run_scan, width="stretch")
+    scan = st.session_state.get("barrier_scan")
+    with info_col:
+        if scan is None:
+            st.caption(
+                f"Will use: **{fe.SOURCE_CLAUDE if api_key else fe.SOURCE_OFFLINE}**"
+                + (f" ({model_name}, key from {key_source})" if api_key else " (no API key)")
+            )
+        elif scan["n_offline"] == 0:
+            st.success(f"Source: **{fe.SOURCE_CLAUDE}** · {scan['model']} · all {scan['n_claude']} notes", icon="🤖")
+        elif scan["n_claude"] == 0:
+            why = "no API key" if not scan["errors"] else "; ".join(scan["errors"])
+            st.warning(f"Source: **{fe.SOURCE_OFFLINE}** (keyword rules) for all {scan['n_offline']} notes · {why}",
+                       icon="🔌")
+        else:
+            st.warning(
+                f"Source: **{fe.SOURCE_CLAUDE}** for {scan['n_claude']} notes, **{fe.SOURCE_OFFLINE}** for "
+                f"{scan['n_offline']} ({'; '.join(scan['errors'])})", icon="⚠️",
+            )
+
+    if scan is not None:
+        summary = fe.barrier_summary(ranked, scan)
+        t1, t2, t3 = st.columns(3)
+        t1.metric("Patients with social barriers", int(summary["social"].sum()))
+        t2.metric("Patients with medical barriers", int(summary["medical"].sum()))
+        t3.metric("Patients scanned", len(summary))
+        st.markdown(
+            f"**{int(summary['social'].sum())} patients with social barriers, "
+            f"{int(summary['medical'].sum())} with medical.**"
         )
+
+        chart_df = fe.social_barrier_by_insurance(summary)
+        chart_df["label"] = chart_df["insurance"] + " (n=" + chart_df["patients"].astype(str) + ")"
+        bars = alt.Chart(chart_df).mark_bar(color=SOCIAL_ORANGE, cornerRadiusEnd=4, size=22).encode(
+            y=alt.Y("label:N", title=None, sort=None),
+            x=alt.X("pct_social:Q", title="% of scanned patients with a social barrier",
+                    scale=alt.Scale(domain=[0, 100])),
+            tooltip=[alt.Tooltip("insurance:N", title="Insurance"),
+                     alt.Tooltip("patients:Q", title="Patients scanned"),
+                     alt.Tooltip("with_social:Q", title="With a social barrier"),
+                     alt.Tooltip("pct_social:Q", title="%", format=".0f")],
+        )
+        text = bars.mark_text(align="left", dx=4, color="gray").encode(text=alt.Text("pct_social:Q", format=".0f"))
+        st.altair_chart((bars + text).properties(height=34 * len(chart_df) + 30), width="stretch")
+        st.caption("Help is routed by documented need, never by insurance type. Clearing these barriers early "
+                   "frees beds sooner and helps the groups that board longest.")
+
+    bar_log = decision_log[decision_log["context"] == "Barrier Flags"]
+    for rank, row in enumerate(ranked.itertuples(), start=1):
+        pid = row.patient_id
+        with st.container(border=True):
+            head, prob = st.columns([2, 3])
+            head.markdown(f"**#{rank} · {pid}** · {row.unit} {row.room} · age {row.age}")
+            prob.progress(float(row.discharge_probability),
+                          text=f"Likely home today: **{row.discharge_probability:.0%}**")
+            st.caption(f"For: {row.reasons_for or '—'}  ·  Against: {row.reasons_against or '—'}")
+            if scan is not None and pid in scan["results"]:
+                r = scan["results"][pid]
+                if not r["barriers"]:
+                    st.caption(f"No barriers flagged · {r['source']}")
+                for j, b in enumerate(r["barriers"]):
+                    badge = ":orange-badge[Social]" if b["type"] == "Social" else ":blue-badge[Medical]"
+                    item = f"{pid}: {b['barrier']}"
+                    done = bar_log[bar_log["item"] == item]
+                    flag_col, btn_col = st.columns([4, 2])
+                    flag_col.markdown(f"{badge} {b['barrier']} · suggested owner: **{b['owner']}**  \n"
+                                      f":gray[{r['source']}]")
+                    if len(done):
+                        e = done.iloc[-1]
+                        btn_col.caption(f"✅ Assigned to {b['owner']} by {e['role']} · {e['time'][11:16]}")
+                    else:
+                        btn_col.button(f"Assign to {b['owner']}", key=f"assign_{pid}_{j}", disabled=not can_assign,
+                                       on_click=assign_barrier, args=(role, pid, b, r["source"]), width="stretch")
+            with st.expander("Note"):
+                st.write(row.nurse_note)
+
 
 # =====================================================================================
 # What-If: beds ready earlier
@@ -568,8 +692,10 @@ with tab_whatif:
              f"{year['room_hours_freed']:,.0f} room-hours × {pprh:.3f} patients/room-hour")
         stat(c3, "Recovered visits per year (est.)", f"{year['recovered_visits']:,.0f}",
              f"{year['patients_roomed_sooner']:,.0f} patients × {fe.LWBS_RATE:.0%} LWBS rate")
-        stat(c4, "Recovered net revenue per year (est.)", f"${year['recovered_revenue']:,.0f}",
-             f"{year['recovered_visits']:,.1f} visits × ${fe.NET_REVENUE_PER_VISIT:,}/visit")
+        stat(c4, "Conservative estimate (freed ED rooms only)",
+             f"≈ ${round(year['recovered_revenue'], -4):,.0f}/yr",
+             f"{year['recovered_visits']:,.1f} visits × ${fe.NET_REVENUE_PER_VISIT:,}/visit "
+             f"= ${year['recovered_revenue']:,.0f}, rounded to the nearest $10K")
         st.caption(
             f"Today: {today['room_hours_freed']:.1f} room-hours × {pprh:.3f} × {fe.LWBS_RATE:.0%} = "
             f"{today['recovered_visits']:.2f} recovered visits × ${fe.NET_REVENUE_PER_VISIT:,} = "
@@ -581,6 +707,12 @@ with tab_whatif:
             f"case's {fe.LWBS_RATE:.0%} left-without-being-seen rate is assumed to be recovered, at "
             f"${fe.NET_REVENUE_PER_VISIT:,} average net revenue per ED visit.",
             icon="📐",
+        )
+        up = fe.upper_lwbs_estimate()
+        st.markdown(
+            f"**Upper estimate:** If the Month-18 goal is met (LWBS {fe.LWBS_RATE:.1%} → {fe.LWBS_GOAL_RATE:.1%}): "
+            f"85,000 × {fe.LWBS_RATE - fe.LWBS_GOAL_RATE:.1%} = {up['visits']:,.0f} visits × "
+            f"${fe.NET_REVENUE_PER_VISIT:,} ≈ ${up['revenue'] / 1e6:.2f}M/yr"
         )
 
 
