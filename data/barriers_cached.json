@@ -1,0 +1,436 @@
+{
+  "source": "Claude (pre-computed)",
+  "description": "Barriers extracted by Claude (Claude Opus 5.5, in a Claude Code session on 2026-11-23) reading the 40 synthetic inpatient notes, following the app's barrier prompt: each barrier tagged Medical or Social with a suggested owner team; no clinical decisions. Synthetic data only.",
+  "rules": "You read short synthetic inpatient notes for a hospital capacity dashboard and list the discharge barriers each note documents.\n\nFor each barrier the note explicitly documents:\n- Write a short phrase describing it, using the note's own facts.\n- Tag it \"Medical\" for clinical items still pending (tests, IV medications, therapy evaluations, consults, limited mobility) or \"Social\" for non-clinical items (transportation, medication cost, placement, housing, insurance authorization, family or caregiver availability).\n- Suggest one owner team: Social work, Case management, Pharmacy, or Hospitalist.\n\nYou are not making clinical decisions. Do not recommend treatments, diagnoses, discharge timing, or levels of care, and do not judge whether the patient is ready to leave. A team member reviews every flag. Do not infer barriers the note does not state; a note that documents none gets an empty list.",
+  "notes": {
+    "IP-3001": {
+      "note": "A&O x4, pain controlled on current regimen. Family updated at bedside.",
+      "barriers": []
+    },
+    "IP-3002": {
+      "note": "Pt resting comfortably, VSS. PT eval not yet completed; unsafe to ambulate independently. Pt reports they can't afford discharge meds. Will continue to monitor.",
+      "barriers": [
+        {
+          "barrier": "PT evaluation not yet completed; not cleared to walk independently",
+          "type": "Medical",
+          "owner": "Hospitalist"
+        },
+        {
+          "barrier": "Cannot afford discharge medications",
+          "type": "Social",
+          "owner": "Pharmacy"
+        }
+      ]
+    },
+    "IP-3003": {
+      "note": "A&O x4, pain controlled on current regimen. Per MD, likely discharge today. Plan per primary team.",
+      "barriers": []
+    },
+    "IP-3004": {
+      "note": "Slept well overnight, tolerating diet. Repeat labs and blood cultures still pending. Pt states no ride home; family unavailable until weekend. Will continue to monitor.",
+      "barriers": [
+        {
+          "barrier": "Repeat labs and blood cultures still pending",
+          "type": "Medical",
+          "owner": "Hospitalist"
+        },
+        {
+          "barrier": "No ride home; family unavailable until the weekend",
+          "type": "Social",
+          "owner": "Social work"
+        }
+      ]
+    },
+    "IP-3005": {
+      "note": "Ambulating in hallway with steady gait. Echo ordered yesterday, still pending read. Will continue to monitor.",
+      "barriers": [
+        {
+          "barrier": "Echo ordered yesterday; read still pending",
+          "type": "Medical",
+          "owner": "Hospitalist"
+        }
+      ]
+    },
+    "IP-3006": {
+      "note": "A&O x4, pain controlled on current regimen. Per MD, likely discharge today. Family updated at bedside.",
+      "barriers": []
+    },
+    "IP-3007": {
+      "note": "Pt resting comfortably, VSS. Per MD, likely discharge today. Plan per primary team.",
+      "barriers": []
+    },
+    "IP-3008": {
+      "note": "Pt resting comfortably, VSS. Repeat labs and blood cultures still pending. Pt reports they can't afford discharge meds. Pt currently staying at a shelter; needs safe discharge plan. Discussed plan of care with pt.",
+      "barriers": [
+        {
+          "barrier": "Repeat labs and blood cultures still pending",
+          "type": "Medical",
+          "owner": "Hospitalist"
+        },
+        {
+          "barrier": "Cannot afford discharge medications",
+          "type": "Social",
+          "owner": "Pharmacy"
+        },
+        {
+          "barrier": "Staying at a shelter; needs a safe discharge plan",
+          "type": "Social",
+          "owner": "Social work"
+        }
+      ]
+    },
+    "IP-3009": {
+      "note": "Pt resting comfortably, VSS. Ambulates with walker and 1 assist. Per MD, likely discharge today. Will continue to monitor.",
+      "barriers": [
+        {
+          "barrier": "Walks with a walker and one-person assist",
+          "type": "Medical",
+          "owner": "Case management"
+        }
+      ]
+    },
+    "IP-3010": {
+      "note": "Pt resting comfortably, VSS. Ambulates with walker and 1 assist. Per MD, likely discharge today. Plan per primary team.",
+      "barriers": [
+        {
+          "barrier": "Walks with a walker and one-person assist",
+          "type": "Medical",
+          "owner": "Case management"
+        }
+      ]
+    },
+    "IP-3011": {
+      "note": "Pt resting comfortably, VSS. Repeat labs and blood cultures still pending. Bedbound; 2-person assist for repositioning. Per MD, likely discharge today. Family updated at bedside.",
+      "barriers": [
+        {
+          "barrier": "Repeat labs and blood cultures still pending",
+          "type": "Medical",
+          "owner": "Hospitalist"
+        },
+        {
+          "barrier": "Bedbound; needs 2-person assist to reposition",
+          "type": "Medical",
+          "owner": "Case management"
+        }
+      ]
+    },
+    "IP-3012": {
+      "note": "Pt resting comfortably, VSS. PT eval not yet completed; unsafe to ambulate independently. Per MD, likely discharge today. Plan per primary team.",
+      "barriers": [
+        {
+          "barrier": "PT evaluation not yet completed; not cleared to walk independently",
+          "type": "Medical",
+          "owner": "Hospitalist"
+        }
+      ]
+    },
+    "IP-3013": {
+      "note": "A&O x4, pain controlled on current regimen. Remains on IV antibiotics, awaiting ID input on PO switch. Plan per primary team.",
+      "barriers": [
+        {
+          "barrier": "On IV antibiotics, awaiting infectious disease input on switch to oral",
+          "type": "Medical",
+          "owner": "Hospitalist"
+        }
+      ]
+    },
+    "IP-3014": {
+      "note": "Slept well overnight, tolerating diet. Repeat labs and blood cultures still pending. Pt states no ride home; family unavailable until weekend. Family updated at bedside.",
+      "barriers": [
+        {
+          "barrier": "Repeat labs and blood cultures still pending",
+          "type": "Medical",
+          "owner": "Hospitalist"
+        },
+        {
+          "barrier": "No ride home; family unavailable until the weekend",
+          "type": "Social",
+          "owner": "Social work"
+        }
+      ]
+    },
+    "IP-3015": {
+      "note": "Slept well overnight, tolerating diet. Per MD, likely discharge today. Will continue to monitor.",
+      "barriers": []
+    },
+    "IP-3016": {
+      "note": "Slept well overnight, tolerating diet. Insurance authorization pending for post-acute care. Pt reports they can't afford discharge meds. Family updated at bedside.",
+      "barriers": [
+        {
+          "barrier": "Insurance authorization pending for post-acute care",
+          "type": "Social",
+          "owner": "Case management"
+        },
+        {
+          "barrier": "Cannot afford discharge medications",
+          "type": "Social",
+          "owner": "Pharmacy"
+        }
+      ]
+    },
+    "IP-3017": {
+      "note": "Afebrile overnight, no acute events. Bedbound; 2-person assist for repositioning. Discussed plan of care with pt.",
+      "barriers": [
+        {
+          "barrier": "Bedbound; needs 2-person assist to reposition",
+          "type": "Medical",
+          "owner": "Case management"
+        }
+      ]
+    },
+    "IP-3018": {
+      "note": "A&O x4, pain controlled on current regimen. Remains on IV antibiotics, awaiting ID input on PO switch. Repeat labs and blood cultures still pending. Ambulates with walker and 1 assist. Plan per primary team.",
+      "barriers": [
+        {
+          "barrier": "On IV antibiotics, awaiting infectious disease input on switch to oral",
+          "type": "Medical",
+          "owner": "Hospitalist"
+        },
+        {
+          "barrier": "Repeat labs and blood cultures still pending",
+          "type": "Medical",
+          "owner": "Hospitalist"
+        },
+        {
+          "barrier": "Walks with a walker and one-person assist",
+          "type": "Medical",
+          "owner": "Case management"
+        }
+      ]
+    },
+    "IP-3019": {
+      "note": "Afebrile overnight, no acute events. Per MD, likely discharge today. Will continue to monitor.",
+      "barriers": []
+    },
+    "IP-3020": {
+      "note": "Ambulating in hallway with steady gait. Pt reports they can't afford discharge meds. Pt currently staying at a shelter; needs safe discharge plan. Discussed plan of care with pt.",
+      "barriers": [
+        {
+          "barrier": "Cannot afford discharge medications",
+          "type": "Social",
+          "owner": "Pharmacy"
+        },
+        {
+          "barrier": "Staying at a shelter; needs a safe discharge plan",
+          "type": "Social",
+          "owner": "Social work"
+        }
+      ]
+    },
+    "IP-3021": {
+      "note": "Afebrile overnight, no acute events. Will continue to monitor.",
+      "barriers": []
+    },
+    "IP-3022": {
+      "note": "Pt resting comfortably, VSS. Ambulates with walker and 1 assist. Insurance authorization pending for post-acute care. Per MD, likely discharge today. Will continue to monitor.",
+      "barriers": [
+        {
+          "barrier": "Walks with a walker and one-person assist",
+          "type": "Medical",
+          "owner": "Case management"
+        },
+        {
+          "barrier": "Insurance authorization pending for post-acute care",
+          "type": "Social",
+          "owner": "Case management"
+        }
+      ]
+    },
+    "IP-3023": {
+      "note": "A&O x4, pain controlled on current regimen. Ambulates with walker and 1 assist. Discussed plan of care with pt.",
+      "barriers": [
+        {
+          "barrier": "Walks with a walker and one-person assist",
+          "type": "Medical",
+          "owner": "Case management"
+        }
+      ]
+    },
+    "IP-3024": {
+      "note": "Slept well overnight, tolerating diet. Pt reports they can't afford discharge meds. Pt states no ride home; family unavailable until weekend. Per MD, likely discharge today. Discussed plan of care with pt.",
+      "barriers": [
+        {
+          "barrier": "Cannot afford discharge medications",
+          "type": "Social",
+          "owner": "Pharmacy"
+        },
+        {
+          "barrier": "No ride home; family unavailable until the weekend",
+          "type": "Social",
+          "owner": "Social work"
+        }
+      ]
+    },
+    "IP-3025": {
+      "note": "A&O x4, pain controlled on current regimen. PT eval not yet completed; unsafe to ambulate independently. Pt states no ride home; family unavailable until weekend. Will continue to monitor.",
+      "barriers": [
+        {
+          "barrier": "PT evaluation not yet completed; not cleared to walk independently",
+          "type": "Medical",
+          "owner": "Hospitalist"
+        },
+        {
+          "barrier": "No ride home; family unavailable until the weekend",
+          "type": "Social",
+          "owner": "Social work"
+        }
+      ]
+    },
+    "IP-3026": {
+      "note": "Afebrile overnight, no acute events. Per MD, likely discharge today. Will continue to monitor.",
+      "barriers": []
+    },
+    "IP-3027": {
+      "note": "Pt resting comfortably, VSS. PT eval not yet completed; unsafe to ambulate independently. Discussed plan of care with pt.",
+      "barriers": [
+        {
+          "barrier": "PT evaluation not yet completed; not cleared to walk independently",
+          "type": "Medical",
+          "owner": "Hospitalist"
+        }
+      ]
+    },
+    "IP-3028": {
+      "note": "Slept well overnight, tolerating diet. Repeat labs and blood cultures still pending. Pt states no ride home; family unavailable until weekend. Per MD, likely discharge today. Family updated at bedside.",
+      "barriers": [
+        {
+          "barrier": "Repeat labs and blood cultures still pending",
+          "type": "Medical",
+          "owner": "Hospitalist"
+        },
+        {
+          "barrier": "No ride home; family unavailable until the weekend",
+          "type": "Social",
+          "owner": "Social work"
+        }
+      ]
+    },
+    "IP-3029": {
+      "note": "Pt resting comfortably, VSS. PT eval not yet completed; unsafe to ambulate independently. Pt currently staying at a shelter; needs safe discharge plan. Plan per primary team.",
+      "barriers": [
+        {
+          "barrier": "PT evaluation not yet completed; not cleared to walk independently",
+          "type": "Medical",
+          "owner": "Hospitalist"
+        },
+        {
+          "barrier": "Staying at a shelter; needs a safe discharge plan",
+          "type": "Social",
+          "owner": "Social work"
+        }
+      ]
+    },
+    "IP-3030": {
+      "note": "Afebrile overnight, no acute events. Ambulates with walker and 1 assist. Per MD, likely discharge today. Discussed plan of care with pt.",
+      "barriers": [
+        {
+          "barrier": "Walks with a walker and one-person assist",
+          "type": "Medical",
+          "owner": "Case management"
+        }
+      ]
+    },
+    "IP-3031": {
+      "note": "Pt resting comfortably, VSS. Echo ordered yesterday, still pending read. Pt reports they can't afford discharge meds. Plan per primary team.",
+      "barriers": [
+        {
+          "barrier": "Echo ordered yesterday; read still pending",
+          "type": "Medical",
+          "owner": "Hospitalist"
+        },
+        {
+          "barrier": "Cannot afford discharge medications",
+          "type": "Social",
+          "owner": "Pharmacy"
+        }
+      ]
+    },
+    "IP-3032": {
+      "note": "Afebrile overnight, no acute events. PT eval not yet completed; unsafe to ambulate independently. Will continue to monitor.",
+      "barriers": [
+        {
+          "barrier": "PT evaluation not yet completed; not cleared to walk independently",
+          "type": "Medical",
+          "owner": "Hospitalist"
+        }
+      ]
+    },
+    "IP-3033": {
+      "note": "Slept well overnight, tolerating diet. Plan per primary team.",
+      "barriers": []
+    },
+    "IP-3034": {
+      "note": "Slept well overnight, tolerating diet. Remains on IV antibiotics, awaiting ID input on PO switch. Plan per primary team.",
+      "barriers": [
+        {
+          "barrier": "On IV antibiotics, awaiting infectious disease input on switch to oral",
+          "type": "Medical",
+          "owner": "Hospitalist"
+        }
+      ]
+    },
+    "IP-3035": {
+      "note": "Ambulating in hallway with steady gait. MRI still pending, not yet scheduled. Family updated at bedside.",
+      "barriers": [
+        {
+          "barrier": "MRI still pending and not yet scheduled",
+          "type": "Medical",
+          "owner": "Hospitalist"
+        }
+      ]
+    },
+    "IP-3036": {
+      "note": "A&O x4, pain controlled on current regimen. Bedbound; 2-person assist for repositioning. Family updated at bedside.",
+      "barriers": [
+        {
+          "barrier": "Bedbound; needs 2-person assist to reposition",
+          "type": "Medical",
+          "owner": "Case management"
+        }
+      ]
+    },
+    "IP-3037": {
+      "note": "Pt resting comfortably, VSS. Per MD, likely discharge today. Plan per primary team.",
+      "barriers": []
+    },
+    "IP-3038": {
+      "note": "A&O x4, pain controlled on current regimen. MRI still pending, not yet scheduled. Remains on IV antibiotics, awaiting ID input on PO switch. Ambulates with walker and 1 assist. Plan per primary team.",
+      "barriers": [
+        {
+          "barrier": "MRI still pending and not yet scheduled",
+          "type": "Medical",
+          "owner": "Hospitalist"
+        },
+        {
+          "barrier": "On IV antibiotics, awaiting infectious disease input on switch to oral",
+          "type": "Medical",
+          "owner": "Hospitalist"
+        },
+        {
+          "barrier": "Walks with a walker and one-person assist",
+          "type": "Medical",
+          "owner": "Case management"
+        }
+      ]
+    },
+    "IP-3039": {
+      "note": "Pt resting comfortably, VSS. Repeat labs and blood cultures still pending. Ambulates with walker and 1 assist. Will continue to monitor.",
+      "barriers": [
+        {
+          "barrier": "Repeat labs and blood cultures still pending",
+          "type": "Medical",
+          "owner": "Hospitalist"
+        },
+        {
+          "barrier": "Walks with a walker and one-person assist",
+          "type": "Medical",
+          "owner": "Case management"
+        }
+      ]
+    },
+    "IP-3040": {
+      "note": "Slept well overnight, tolerating diet. Discussed plan of care with pt.",
+      "barriers": []
+    }
+  }
+}

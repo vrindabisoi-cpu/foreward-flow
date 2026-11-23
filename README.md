@@ -29,7 +29,12 @@ A staff-facing Streamlit dashboard for **emergency department (ED) patient flow 
 - Inpatients ranked by **likely to go home today**, with probability and top reasons.
 - **Scan notes with AI** sends each note to the Claude API (official `anthropic` Python SDK, `POST /v1/messages`, structured JSON output). Claude returns each barrier tagged **Medical** or **Social** with a suggested owner team (Social work, Case management, Pharmacy, Hospitalist). It is told not to make clinical decisions, and only the note text is sent, never insurance or demographics.
 - **API key:** entered in the sidebar password box or set as `ANTHROPIC_API_KEY`. It is never hard-coded, saved, or logged. The model name is editable in the sidebar; the default is `claude-opus-5-5`. Server-side refusal fallback is on for models that support it.
-- **Offline fallback:** with no key, or for any note whose call fails, keyword rules flag the barriers instead. The page always says which source was used ("Claude API" or "Offline fallback") and why.
+- **Three sources, in this order:**
+  1. **Claude API:** a live call, when an API key is set.
+  2. **Claude (pre-computed):** with no key, or for any note whose live call fails, the app loads `data/barriers_cached.json`. That file holds Claude's reading of all 40 synthetic notes under the same rules (Medical or Social, an owner team, no clinical decisions). It is used only for notes whose text exactly matches, and the page says: "Source: Claude (pre-computed run on synthetic notes). In production this runs live via the API."
+  3. **Offline fallback:** keyword rules, used only if the cached file is missing or a note isn't in it.
+
+  The page always says which source was used and why. "No ride home" is routed to Social work.
 - **Show:** All / Only patients with barriers (default) / Social only.
 - Totals at the top, orange **Social** and blue **Medical** flags per patient, the note in an expander, and an **Assign to [owner team]** button. Only the **Case manager** or **Social worker** role can assign; each assignment is logged with the barrier text.
 - A bar chart shows the % of scanned patients with a social barrier by insurance group. Help is routed by documented need, never by insurance type.
@@ -226,5 +231,6 @@ Then open http://localhost:8501.
 .streamlit/       config.toml: hospital-blue theme
 app.py            Streamlit UI
 flow_engine.py    Synthetic data, models, bed-type rules, and bed forecast
+data/barriers_cached.json  Claude's pre-computed barrier reading of the 40 synthetic notes
 requirements.txt  streamlit, pandas, numpy, scikit-learn, anthropic
 ```

@@ -1276,7 +1276,21 @@ DEFAULT_CLAUDE_MODEL = "claude-opus-5-5"
 # Models that accept server-side refusal fallbacks (fallbacks="default").
 _FALLBACK_MODELS = {"claude-fable-5-2", "claude-fable-5-1", "claude-opus-5-5", "claude-opus-5", "claude-sonnet-5-5"}
 SOURCE_CLAUDE = "Claude API"
+SOURCE_CACHED = "Claude (pre-computed)"
 SOURCE_OFFLINE = "Offline fallback"
+CACHED_BARRIERS_PATH = Path(__file__).resolve().parent / "data" / "barriers_cached.json"
+
+
+def load_cached_barriers(path: Path | None = None) -> dict:
+    """Pre-computed Claude reading of the synthetic notes: {patient_id: {note, barriers}}.
+    Returns {} if the file is missing or unreadable."""
+    path = Path(path or CACHED_BARRIERS_PATH)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return {pid: {"note": r["note"], "barriers": _validated(r["barriers"])}
+                for pid, r in data.get("notes", {}).items()}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return {}
 
 BARRIER_SYSTEM_PROMPT = """You read short synthetic inpatient notes for a hospital capacity dashboard and list the discharge barriers each note documents.
 
@@ -1393,15 +1407,27 @@ def _describe_error(exc: Exception) -> str:
     return str(exc) or type(exc).__name__
 
 
-def scan_notes(inpatients: pd.DataFrame, api_key: str | None, model: str, client=None) -> dict:
-    """Scan every note. Uses Claude when a key is given; any note whose call
-    fails (or every note, with no key) uses the offline keyword fallback.
+def scan_notes(inpatients: pd.DataFrame, api_key: str | None, model: str, client=None,
+               cached_path: Path | None = None) -> dict:
+    """Scan every note for discharge barriers.
+
+    - With an API key: each note goes to the Claude API live.
+    - Without a key, or for a note whose live call fails: use the pre-computed
+      Claude reading (data/barriers_cached.json) if it has this exact note.
+    - Otherwise: the offline keyword fallback.
 
     The API key is only passed to the SDK client. It is never stored,
     returned, or written to the decision log.
     """
     notes = dict(zip(inpatients["patient_id"], inpatients["nurse_note"]))
+    cached = load_cached_barriers(cached_path)
     results, errors = {}, []
+
+    def without_live(pid, err):
+        c = cached.get(pid)
+        if c is not None and c["note"] == notes[pid]:
+            return {"source": SOURCE_CACHED, "barriers": c["barriers"], "error": err}
+        return {"source": SOURCE_OFFLINE, "barriers": offline_barriers(notes[pid]), "error": err}
 
     if api_key or client is not None:
         if client is None:
@@ -1422,17 +1448,19 @@ def scan_notes(inpatients: pd.DataFrame, api_key: str | None, model: str, client
                     results[pid] = {"source": SOURCE_CLAUDE, "barriers": barriers}
                 else:
                     errors.append(err)
-                    results[pid] = {"source": SOURCE_OFFLINE, "barriers": offline_barriers(notes[pid]), "error": err}
+                    results[pid] = without_live(pid, err)
     else:
-        for pid, note in notes.items():
-            results[pid] = {"source": SOURCE_OFFLINE, "barriers": offline_barriers(note), "error": "No API key"}
+        for pid in notes:
+            results[pid] = without_live(pid, "No API key")
 
-    n_claude = sum(r["source"] == SOURCE_CLAUDE for r in results.values())
+    counts = {s: sum(r["source"] == s for r in results.values())
+              for s in (SOURCE_CLAUDE, SOURCE_CACHED, SOURCE_OFFLINE)}
     return {
         "results": results,
         "model": model,
-        "n_claude": n_claude,
-        "n_offline": len(results) - n_claude,
+        "n_claude": counts[SOURCE_CLAUDE],
+        "n_cached": counts[SOURCE_CACHED],
+        "n_offline": counts[SOURCE_OFFLINE],
         "errors": sorted(set(errors)),
     }
 

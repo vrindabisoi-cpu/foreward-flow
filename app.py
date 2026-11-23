@@ -657,21 +657,28 @@ with tab_barriers:
         scan = st.session_state.get("barrier_scan")
         with info_col:
             if scan is None:
-                st.caption(
-                    f"Will use: **{fe.SOURCE_CLAUDE if api_key else fe.SOURCE_OFFLINE}**"
-                    + (f" ({model_name}, key from {key_source})" if api_key else " (no API key)")
-                )
-            elif scan["n_offline"] == 0:
-                st.success(f"Source: **{fe.SOURCE_CLAUDE}** · {scan['model']} · all {scan['n_claude']} notes", icon="🤖")
-            elif scan["n_claude"] == 0:
-                why = "no API key" if not scan["errors"] else "; ".join(scan["errors"])
-                st.warning(f"Source: **{fe.SOURCE_OFFLINE}** (keyword rules) for all {scan['n_offline']} notes · {why}",
-                           icon="🔌")
+                if api_key:
+                    st.caption(f"Will use: **{fe.SOURCE_CLAUDE}** ({model_name}, key from {key_source})")
+                else:
+                    st.caption(f"Will use: **{fe.SOURCE_CACHED}** (no API key)")
             else:
-                st.warning(
-                    f"Source: **{fe.SOURCE_CLAUDE}** for {scan['n_claude']} notes, **{fe.SOURCE_OFFLINE}** for "
-                    f"{scan['n_offline']} ({'; '.join(scan['errors'])})", icon="⚠️",
-                )
+                n_total = scan["n_claude"] + scan["n_cached"] + scan["n_offline"]
+                why = "; ".join(scan["errors"])
+                if scan["n_claude"] == n_total:
+                    st.success(f"Source: **{fe.SOURCE_CLAUDE}** · {scan['model']} · all {n_total} notes", icon="🤖")
+                elif scan["n_cached"] == n_total and not why:
+                    st.info("Source: **Claude (pre-computed run on synthetic notes).** "
+                            "In production this runs live via the API.", icon="🤖")
+                elif scan["n_offline"] == n_total:
+                    reason = why or "no API key and no pre-computed file"
+                    st.warning(f"Source: **{fe.SOURCE_OFFLINE}** (keyword rules) for all {n_total} notes · {reason}",
+                               icon="🔌")
+                else:
+                    parts = [f"**{label}** for {n} notes" for label, n in [
+                        (fe.SOURCE_CLAUDE, scan["n_claude"]),
+                        ("Claude (pre-computed run on synthetic notes)", scan["n_cached"]),
+                        (fe.SOURCE_OFFLINE + " (keyword rules)", scan["n_offline"])] if n]
+                    st.warning("Source: " + ", ".join(parts) + (f" · live API: {why}" if why else ""), icon="⚠️")
 
         if scan is not None:
             summary = fe.barrier_summary(ranked, scan)
