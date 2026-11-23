@@ -2,7 +2,7 @@
 
 A staff-facing Streamlit dashboard for **emergency department (ED) patient flow and boarding** at a fictional 320-bed hospital, built for a hospital case competition.
 
-> **All data is synthetic.** No real patients, staff, or hospital records are used. Every dataset is generated in code from a fixed random seed (`42`), so the numbers are the same on every run.
+> **All data is synthetic, calibrated to the Halvian case brief.** No real patients, staff, or hospital records are used. Every dataset is generated in code from a fixed random seed (`42`), so the numbers are the same on every run. The only non-synthetic numbers are the case brief's equity baseline, shown in the Equity tab.
 
 ## What it shows
 
@@ -22,14 +22,19 @@ A staff-facing Streamlit dashboard for **emergency department (ED) patient flow 
 - **Likely to go home today.** Current inpatients ranked by their chance of discharge today, with the top reasons for it and the main barriers against it.
 - **Model performance** in the sidebar: both models' AUC, tested on held-out synthetic data.
 
+### Equity tab
+
+- **Halvian baseline** from the case brief: door-to-provider time and left-without-being-seen (LWBS) rate by payer, with gaps against Commercial.
+- **Boarding time by payer** from the synthetic 30-day boarding history.
+
 ## Models
 
 Both models are **logistic regressions** (scikit-learn), chosen because they're explainable: every prediction can be broken down into how much each input moved it. Each is trained on 75% of its synthetic history and tested on the other 25%.
 
 | Model | Trained on | Inputs | Test AUC |
 |---|---|---|---|
-| Admission at triage | 6,000 past ED visits | age, triage acuity, heart rate, O₂ sat, temperature, blood pressure, chief complaint, cardiac history, prior ED visits | 0.82 |
-| Likely home today | 3,000 past inpatient days | days past expected stay, pending test, IV meds, mobility, physician noted likely discharge today, documented social barrier | 0.88 |
+| Admission at triage | 6,000 past ED visits | age, triage acuity, heart rate, O₂ sat, temperature, blood pressure, chief complaint, cardiac history, prior ED visits | 0.84 |
+| Likely home today | 3,000 past inpatient days | days past expected stay, pending test, IV meds, mobility, physician noted likely discharge today, documented social barrier | 0.89 |
 
 **Reasons.** Each reason is an input's coefficient times its standardized value: how far it moves this patient's score compared with the average patient in the training data.
 
@@ -49,12 +54,14 @@ Projected open beds at each hour from 9 AM to 5 PM:
 - **Rooms cleaned:** beds that need cleaning come back at one per hour.
 - **Expected discharges** come from the likely-home-today model. The unit's average probability is applied to every occupied bed, and discharges are weighted toward the afternoon, mostly after 2 PM.
 - **Expected admissions** are:
-  - boarders already admitted to the unit;
+  - boarders already admitted to the unit, placed one per hour as beds open;
   - ED patients in workup whose likely bed is that unit, weighted by admit probability;
-  - new ED arrivals by hour, adjusted by:
-    - **day of week:** Monday +15%;
-    - **local flu/RSV trend:** Normal, Elevated +20%, or High +35%;
+  - new ED arrivals by hour × the 16% admit rate × the unit's share of ED admissions (Medicine 60%), adjusted by:
+    - **day of week:** Monday +15% (Sunday −8%), from the arrival pattern;
+    - **local flu/RSV trend:** Normal, Elevated +20%, or High +35%. This stands in for the brief's +20% winter respiratory season, so the season is not counted twice;
     - **news alerts** a house supervisor has applied.
+
+A unit **runs out** when projected open beds drop below zero.
 
 The sidebar day-of-week and flu/RSV trend are set automatically from the synthetic "today" (Monday) and the simulated surveillance feed. Staff can override both.
 
@@ -62,14 +69,14 @@ With the default inputs (Monday, elevated flu/RSV), **Medicine is projected to r
 
 ### Capacity tiers
 
-The tier is picked from the lowest projected open-bed count.
+The tier is picked from the lowest projected open-bed count, using the same cut-off as the run-out warning.
 
 | Tier | When | Backup actions |
 |---|---|---|
-| Normal | 3 or more open beds all day | Routine huddles |
-| Level 1 — Tight | Lowest point is 1–2 open beds | Work the likely-home-today list first; open discharge lounge; prioritize cleaning; extra bed huddle |
-| Level 2 — Full | Runs out, short up to 3 beds | Flex beds with extra nurse shifts; hallway-bed protocol for stable patients (RN approval); inpatient teams round on ED boarders; fast-track |
-| Level 3 — Crisis | Short 4 or more beds | Delay non-urgent planned surgeries (CMO approval); transfer stable patients; ambulance diversion as a last resort |
+| Normal | About 3 or more open beds all day | Routine huddles |
+| Level 1 — Tight | Gets down to 0–2 open beds but does not run out | Work the likely-home-today list first; open discharge lounge; prioritize cleaning; extra bed huddle |
+| Level 2 — Full | Runs out, short up to about 2 beds | Flex beds with extra nurse shifts; hallway-bed protocol for stable patients (RN approval); inpatient teams round on ED boarders; fast-track |
+| Level 3 — Crisis | Short about 3 or more beds | Delay non-urgent planned surgeries (CMO approval); transfer stable patients; ambulance diversion as a last resort |
 
 ### Human in the loop
 
@@ -83,20 +90,30 @@ The tier is picked from the lowest projected open-bed count.
 
 All generators live in [`flow_engine.py`](flow_engine.py).
 
+**Calibration to the Halvian case brief**
+
+| Target | Brief | Synthetic data |
+|---|---|---|
+| ED admit rate | about 16% | 15.9% of 6,000 past visits |
+| Payer mix | Medicaid/CHIP 35%, Medicare 22%, Commercial 33%, Uninsured 8%, Other 2% | Same shares wherever insurance is generated |
+| ED arrivals | about 233/day (85,000/year) | 85,247 in the past year (233.6/day) |
+| Arrival pattern | Weekday morning and evening peaks; Monday busiest; winter respiratory season +20% | Weekday peaks at 10–11 AM and 6–7 PM; Monday about 268/day; December–February +20% |
+| Beds | 320 total incl. 24 ICU, about 88% occupied, about 40 open | 281 occupied (87.8%); 39 unoccupied (29 open + 10 needs cleaning); Medicine tightest at 95% |
+| Boarding history | median about 3.5 hours | median 211 minutes |
+
 | Function | Contents |
 |---|---|
 | `generate_bed_status()` | Medicine (120 beds), Surgery (80), Telemetry (56), ICU (24), Women's & Peds (40). Medicine is deliberately tight: 3 open, 3 needing cleaning. |
+| `generate_ed_arrivals()` | One year of hourly ED arrivals with day-of-week, time-of-day, and respiratory-season patterns. |
 | `generate_ed_visits()` | 6,000 past ED visits: age, triage acuity (1–5), heart rate, O₂ saturation, temperature, blood pressure, chief complaint, cardiac history, prior visits, insurance group, and an `admitted` outcome. |
-| `generate_current_ed_patients()` | 14 patients in the ED now: 6 admitted and boarding (with hours boarding and admitting unit), 8 still in workup. |
+| `generate_current_ed_patients()` | 14 patients in the ED now: 6 admitted and boarding (3 of them waiting for Medicine, the tightest unit), 8 still in workup. |
 | `generate_inpatients()` | 40 inpatients with unit, room, age, insurance, length of stay, and a short nurse note. Notes may mention medical barriers (pending MRI, IV antibiotics, PT eval…) or social barriers (no ride home, can't afford meds, nursing-home placement, shelter, insurance authorization). |
 | `generate_past_inpatient_stays()` | 3,000 past inpatient days with days past expected stay, pending test, IV meds, mobility, physician discharge note, social barrier, and a `discharged_that_day` outcome. |
 | `generate_boarding_history()` | 30 days of ED boarding times by insurance group. |
 
-**Insurance mix:** Commercial 33%, Medicare 22%, Medicaid 35%, Uninsured 10%.
-
 **Built-in disparities.** The data includes patterns for the dashboard to surface:
-- Social discharge barriers are more common for Medicaid and Uninsured patients.
-- Medicaid patients board about 36 minutes longer than the overall average.
+- Social discharge barriers are more common for Medicaid/CHIP and Uninsured patients.
+- Medicaid/CHIP patients board about 37 minutes longer than the overall average.
 
 ## Fairness safeguards
 

@@ -111,6 +111,9 @@ with st.sidebar:
     )
     st.caption(f"Source: {feed['source']}, as of {feed['as_of']}.")
 
+    st.header("Data sources")
+    st.caption(fe.DATA_SOURCES_NOTE)
+
     st.header("Model performance")
     st.metric("Admission at triage — AUC", f"{admission_model.auc:.2f}")
     st.metric("Likely home today — AUC", f"{discharge_model.auc:.2f}")
@@ -127,7 +130,7 @@ st.caption(f"{fe.HOSPITAL_NAME} · Synthetic data only — not real patients")
 if "flash" in st.session_state:
     st.error(st.session_state.pop("flash"))
 
-tab_control, tab_flow = st.tabs(["AI Control Center", "Patient flow"])
+tab_control, tab_flow, tab_equity = st.tabs(["AI Control Center", "Patient flow", "Equity"])
 
 # =====================================================================================
 # AI Control Center
@@ -463,3 +466,56 @@ with tab_flow:
             hide_index=True,
             width="stretch",
         )
+
+# =====================================================================================
+# Equity
+# =====================================================================================
+with tab_equity:
+    st.subheader("Halvian baseline")
+    st.caption("From the Halvian case brief (not synthetic): ED performance by payer before ForeWard Flow.")
+    base = fe.HALVIAN_BASELINE.copy()
+    ref = base.set_index("group").loc["Commercial"]
+    base["dtp_gap"] = base["door_to_provider_min"] - ref["door_to_provider_min"]
+    base["lwbs_gap"] = (base["lwbs_pct"] - ref["lwbs_pct"]).round(1)
+    base.loc[base["group"].isin(["Commercial", "Overall"]), ["dtp_gap", "lwbs_gap"]] = None
+
+    overall = base.set_index("group").loc["Overall"]
+    c1, c2 = st.columns(2)
+    c1.metric("Door-to-provider, overall", f"{overall['door_to_provider_min']:.0f} min")
+    c2.metric("Left without being seen, overall", f"{overall['lwbs_pct']:.1f}%")
+    st.dataframe(
+        base,
+        hide_index=True,
+        width="stretch",
+        column_config={
+            "group": "Payer",
+            "door_to_provider_min": st.column_config.NumberColumn("Door-to-provider (min)", format="%d"),
+            "dtp_gap": st.column_config.NumberColumn("vs Commercial (min)", format="%+d"),
+            "lwbs_pct": st.column_config.NumberColumn("Left without being seen (%)", format="%.1f"),
+            "lwbs_gap": st.column_config.NumberColumn("vs Commercial (pts)", format="%+.1f"),
+        },
+    )
+    st.caption(
+        "Uninsured patients wait 16 minutes longer than Commercial patients to see a provider "
+        "and leave without being seen almost twice as often (5.8% vs 3.0%)."
+    )
+
+    st.subheader("Boarding time by payer (synthetic, last 30 days)")
+    gap = fe.boarding_gap_by_insurance(data["boarding"])
+    st.dataframe(
+        gap,
+        hide_index=True,
+        width="stretch",
+        column_config={
+            "insurance": "Payer",
+            "patients": "Boarded patients",
+            "mean_minutes": st.column_config.NumberColumn("Mean (min)", format="%.0f"),
+            "median_minutes": st.column_config.NumberColumn("Median (min)", format="%.0f"),
+            "vs_overall_minutes": st.column_config.NumberColumn("vs overall mean (min)", format="%+.0f"),
+        },
+    )
+    medicaid_gap = gap.set_index("insurance").at[fe.MEDICAID, "vs_overall_minutes"]
+    st.caption(
+        f"Overall median boarding time: {data['boarding']['boarding_minutes'].median() / 60:.1f} hours. "
+        f"Medicaid/CHIP patients board about {medicaid_gap:.0f} minutes longer than average."
+    )

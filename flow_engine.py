@@ -33,8 +33,11 @@ UNIT_CAPACITY = {
     "Women's & Peds": 40,
 }
 
-INSURANCE_GROUPS = ["Commercial", "Medicare", "Medicaid", "Uninsured"]
-INSURANCE_SHARES = [0.33, 0.22, 0.35, 0.10]
+# Payer mix from the Halvian case brief, used everywhere insurance is generated.
+MEDICAID = "Medicaid/CHIP"
+INSURANCE_GROUPS = ["Commercial", "Medicare", MEDICAID, "Uninsured", "Other"]
+INSURANCE_SHARES = [0.33, 0.22, 0.35, 0.08, 0.02]
+SOCIAL_RISK_PAYERS = (MEDICAID, "Uninsured")
 
 CHIEF_COMPLAINTS = {
     # complaint: (sampling weight, admission log-odds effect)
@@ -88,16 +91,23 @@ def _sigmoid(x):
 # Bed status
 # ---------------------------------------------------------------------------
 
+# Calibrated to the case brief: 320 beds, ~88% occupied (281), 39 unoccupied
+# (29 open + 10 needs cleaning). Medicine is the tightest unit.
+BED_BOARD = {
+    # unit: (open, needs_cleaning)
+    "Medicine": (3, 3),
+    "Surgery": (10, 2),
+    "Telemetry": (5, 2),
+    "ICU": (2, 1),
+    "Women's & Peds": (9, 2),
+}
+
+
 def generate_bed_status() -> pd.DataFrame:
     """Current bed board: open / needs cleaning / occupied per unit."""
-    rng = _rng(1)
     rows = []
     for unit, total in UNIT_CAPACITY.items():
-        if unit == "Medicine":
-            open_beds, cleaning = 3, 3  # Medicine is deliberately tight
-        else:
-            open_beds = int(rng.integers(max(2, total // 20), max(4, total // 8) + 1))
-            cleaning = int(rng.integers(1, max(2, total // 20) + 1))
+        open_beds, cleaning = BED_BOARD[unit]
         occupied = total - open_beds - cleaning
         rows.append(
             {
@@ -124,7 +134,7 @@ def _ages_for_insurance(insurance: np.ndarray, rng: np.random.Generator) -> np.n
         if ins == "Medicare":
             # mostly 65+, a few younger (disability)
             ages[i] = rng.normal(75, 8) if rng.random() < 0.9 else rng.normal(50, 10)
-        elif ins in ("Commercial", "Medicaid") and rng.random() < 0.13:
+        elif ins in ("Commercial", MEDICAID) and rng.random() < 0.13:
             ages[i] = rng.uniform(0, 17)  # pediatric visits
         else:
             ages[i] = rng.normal(44, 15)
@@ -153,7 +163,7 @@ def _generate_visit_features(n: int, rng: np.random.Generator) -> pd.DataFrame:
     cardiac_history = rng.random(n) < _sigmoid(-3.2 + 0.05 * (age - 40))
 
     visit_rate = np.select(
-        [insurance == "Medicaid", insurance == "Uninsured", insurance == "Medicare"],
+        [insurance == MEDICAID, insurance == "Uninsured", insurance == "Medicare"],
         [1.3, 1.1, 1.2],
         default=0.7,
     )
@@ -176,12 +186,15 @@ def _generate_visit_features(n: int, rng: np.random.Generator) -> pd.DataFrame:
     )
 
 
+ADMISSION_INTERCEPT = -2.93  # tuned so ~16% of historical ED visits are admitted
+
+
 def _admission_logit(df: pd.DataFrame) -> np.ndarray:
     """Clinical-only ground truth. Fairness columns play no role."""
     acuity_effect = df["triage_acuity"].map({1: 3.0, 2: 1.7, 3: 0.4, 4: -1.1, 5: -2.2})
     complaint_effect = df["chief_complaint"].map({c: v[1] for c, v in CHIEF_COMPLAINTS.items()})
     return (
-        -1.9
+        ADMISSION_INTERCEPT
         + acuity_effect
         + complaint_effect
         + 0.022 * (df["age"] - 50)
@@ -227,6 +240,9 @@ def generate_ed_visits(n: int = 6000) -> pd.DataFrame:
     return df
 
 
+MEDICINE_BOARDERS = 3
+
+
 def generate_current_ed_patients() -> pd.DataFrame:
     """14 patients in the ED now: 6 admitted & boarding, 8 still in workup."""
     rng = _rng(4)
@@ -235,10 +251,16 @@ def generate_current_ed_patients() -> pd.DataFrame:
     pool = _generate_visit_features(300, rng)
     true_p = _sigmoid(_admission_logit(pool))
     was_admitted = rng.random(len(pool)) < true_p
+    bed = pool.apply(lambda r: predict_bed_type(r)[0], axis=1)
     admits = pool[was_admitted]
-    # Demo: lead with a clear-cut adult admit (true probability > 90%).
-    lead = admits[(true_p[was_admitted] > 0.90) & (admits["age"] >= 18)].head(1)
-    boarders = pd.concat([lead, admits.drop(lead.index).head(5)])
+    to_medicine = bed[was_admitted] == "Medicine"
+    # Boarding piles up on the tightest unit, so half the boarders need Medicine.
+    # Demo: lead with the clearest-cut adult Medicine admit (highest true probability).
+    candidates = admits[to_medicine & (admits["age"] >= 18)]
+    lead = candidates.loc[[pd.Series(true_p, index=pool.index)[candidates.index].idxmax()]]
+    medicine = admits[to_medicine].drop(lead.index).head(MEDICINE_BOARDERS - len(lead))
+    other = admits[~to_medicine].head(6 - len(lead) - len(medicine))
+    boarders = pd.concat([lead, medicine, other])
     workup = pool.drop(boarders.index).head(8)
     df = pd.concat([boarders, workup], ignore_index=True)
 
@@ -254,6 +276,62 @@ def generate_current_ed_patients() -> pd.DataFrame:
     df["hours_in_ed"] = np.round(rng.uniform(0.5, 6, 14), 1)
     df.loc[:5, "hours_in_ed"] = df.loc[:5, "hours_boarding"] + np.round(rng.uniform(2, 5, 6), 1)
     return df
+
+
+# ---------------------------------------------------------------------------
+# ED arrivals (calibrated to the case brief)
+# ---------------------------------------------------------------------------
+
+ED_ARRIVALS_PER_YEAR = 85_000  # ~233/day
+ED_ADMIT_RATE = 0.16
+# Monday is the busiest day; multipliers average to 1.0 across the week.
+DOW_ARRIVAL_MULTIPLIER = {
+    "Monday": 1.15, "Tuesday": 1.03, "Wednesday": 0.99, "Thursday": 0.98,
+    "Friday": 0.99, "Saturday": 0.94, "Sunday": 0.92,
+}
+RESPIRATORY_SEASON_MONTHS = (12, 1, 2)  # winter respiratory season
+RESPIRATORY_SEASON_BOOST = 0.20
+
+# Relative arrivals by hour (0 = midnight). Weekdays peak mid-morning and
+# early evening; weekends are flatter.
+_WEEKDAY_HOURLY = np.array([2.2, 1.8, 1.5, 1.3, 1.3, 1.6, 2.4, 3.4, 4.6, 5.6, 6.2, 6.1,
+                            5.6, 5.3, 5.2, 5.3, 5.6, 6.0, 6.3, 6.2, 5.5, 4.6, 3.7, 2.9])
+_WEEKEND_HOURLY = np.array([2.8, 2.4, 2.0, 1.7, 1.5, 1.6, 2.0, 2.8, 3.8, 4.7, 5.3, 5.6,
+                            5.6, 5.5, 5.4, 5.3, 5.3, 5.4, 5.5, 5.4, 5.0, 4.4, 3.7, 3.1])
+WEEKDAY_HOURLY_SHARE = _WEEKDAY_HOURLY / _WEEKDAY_HOURLY.sum()
+WEEKEND_HOURLY_SHARE = _WEEKEND_HOURLY / _WEEKEND_HOURLY.sum()
+
+
+def hourly_arrival_share(day_of_week: str) -> np.ndarray:
+    return WEEKEND_HOURLY_SHARE if day_of_week in ("Saturday", "Sunday") else WEEKDAY_HOURLY_SHARE
+
+
+def _season_days(year_days: pd.DatetimeIndex) -> np.ndarray:
+    return np.isin(year_days.month, RESPIRATORY_SEASON_MONTHS)
+
+
+# Base daily arrivals with the seasonal boost removed, so the yearly total
+# still averages ED_ARRIVALS_PER_YEAR.
+_YEAR = pd.date_range("2025-01-01", "2025-12-31")
+BASE_DAILY_ARRIVALS = (ED_ARRIVALS_PER_YEAR / 365) / (1 + RESPIRATORY_SEASON_BOOST * _season_days(_YEAR).mean())
+
+
+def generate_ed_arrivals(days: int = 365) -> pd.DataFrame:
+    """Hourly ED arrivals for the past year (one row per date and hour)."""
+    rng = _rng(8)
+    dates = pd.date_range(end=REFERENCE_DATE - pd.Timedelta(days=1), periods=days)
+    in_season = _season_days(dates)
+    rows = []
+    for date, season in zip(dates, in_season):
+        dow = date.day_name()
+        daily = BASE_DAILY_ARRIVALS * DOW_ARRIVAL_MULTIPLIER[dow] * (1 + RESPIRATORY_SEASON_BOOST * season)
+        counts = rng.poisson(daily * hourly_arrival_share(dow))
+        for hour, n in enumerate(counts):
+            rows.append(
+                {"date": date, "day_of_week": dow, "hour": hour,
+                 "respiratory_season": bool(season), "arrivals": int(n)}
+            )
+    return pd.DataFrame(rows)
 
 
 # ---------------------------------------------------------------------------
@@ -315,7 +393,7 @@ def generate_inpatients(n: int = 40) -> pd.DataFrame:
     The structured columns (pending_test, iv_meds, mobility,
     physician_noted_dc_today, social_barrier) match what the note says.
     `medical_barriers` / `social_barriers` hold the specific barrier tags.
-    Social barriers are more common for Medicaid and Uninsured patients.
+    Social barriers are more common for Medicaid/CHIP and Uninsured patients.
     """
     rng = _rng(5)
     units = rng.choice(list(UNIT_CAPACITY), size=n, p=[0.40, 0.22, 0.18, 0.08, 0.12])
@@ -345,7 +423,7 @@ def generate_inpatients(n: int = 40) -> pd.DataFrame:
         else:
             mobility = str(rng.choice(MOBILITY_LEVELS, p=[0.75, 0.18, 0.07]))
 
-        social_p = 0.55 if ins in ("Medicaid", "Uninsured") else 0.15
+        social_p = 0.55 if ins in SOCIAL_RISK_PAYERS else 0.15
         soc = []
         if rng.random() < social_p:
             options = list(SOCIAL_BARRIERS)
@@ -412,7 +490,7 @@ def generate_past_inpatient_stays(n: int = 3000) -> pd.DataFrame:
         rng.choice(MOBILITY_LEVELS, size=n, p=[0.50, 0.32, 0.18]),
         rng.choice(MOBILITY_LEVELS, size=n, p=[0.75, 0.18, 0.07]),
     )
-    social_p = np.where(np.isin(insurance, ["Medicaid", "Uninsured"]), 0.45, 0.15)
+    social_p = np.where(np.isin(insurance, SOCIAL_RISK_PAYERS), 0.45, 0.15)
     social = (rng.random(n) < social_p).astype(int)
 
     limited = (mobility != "Independent").astype(int)
@@ -456,20 +534,24 @@ def generate_past_inpatient_stays(n: int = 3000) -> pd.DataFrame:
 # Boarding times by insurance (30 days)
 # ---------------------------------------------------------------------------
 
+BOARDING_GAMMA_SCALE = 33.5  # tuned so the overall median is ~210 min (3.5 h)
+
+
 def generate_boarding_history(days: int = 30) -> pd.DataFrame:
     """One row per boarded ED patient over the last `days` days.
 
-    Medicaid boarders wait ~30+ minutes longer than the overall average.
+    Calibrated to a ~3.5-hour overall median. Medicaid/CHIP boarders wait
+    ~30+ minutes longer than the overall average.
     """
     rng = _rng(7)
-    insurance_offset = {"Commercial": -5, "Medicare": 0, "Medicaid": 60, "Uninsured": 15}
+    insurance_offset = {"Commercial": -5, "Medicare": 0, MEDICAID: 60, "Uninsured": 15, "Other": 0}
     rows = []
     for d in range(days, 0, -1):
         date = REFERENCE_DATE - pd.Timedelta(days=d)
         n_boarders = int(rng.integers(8, 16))
         ins = rng.choice(INSURANCE_GROUPS, size=n_boarders, p=INSURANCE_SHARES)
         for g in ins:
-            minutes = rng.gamma(shape=6.0, scale=38.0) + insurance_offset[g]
+            minutes = rng.gamma(shape=6.0, scale=BOARDING_GAMMA_SCALE) + insurance_offset[g]
             rows.append(
                 {
                     "date": date.normalize(),
@@ -485,7 +567,7 @@ def boarding_gap_by_insurance(boarding: pd.DataFrame) -> pd.DataFrame:
     overall = boarding["boarding_minutes"].mean()
     out = (
         boarding.groupby("insurance")["boarding_minutes"]
-        .agg(patients="count", mean_minutes="mean")
+        .agg(patients="count", mean_minutes="mean", median_minutes="median")
         .reindex(INSURANCE_GROUPS)
         .reset_index()
     )
@@ -700,24 +782,23 @@ BOARDING_COST_PER_HOUR = 350  # dollars per boarding hour
 FORECAST_START_HOUR = 9  # 9 AM
 FORECAST_HOURS = 8  # through 5 PM
 
-DAYS_OF_WEEK = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-DAY_ADJUSTMENT = {"Monday": 0.15}  # Monday: +15% admissions; other days +0%
+DAYS_OF_WEEK = list(DOW_ARRIVAL_MULTIPLIER)
+# Day-of-week effect on admissions, from the arrival pattern (Monday +15%).
+DAY_ADJUSTMENT = {d: round(m - 1, 2) for d, m in DOW_ARRIVAL_MULTIPLIER.items()}
 
 TREND_LEVELS = {"Normal": 0.0, "Elevated flu/RSV": 0.20, "High": 0.35}
 
-# New ED arrivals expected to need each unit, per hour, on a typical day.
-NEW_ADMITS_PER_HOUR = {
-    "Medicine": 1.5,
-    "Surgery": 0.9,
-    "Telemetry": 0.55,
-    "ICU": 0.3,
-    "Women's & Peds": 0.6,
+# Share of ED admissions that go to each unit.
+UNIT_ADMIT_SHARE = {
+    "Medicine": 0.60,
+    "Surgery": 0.12,
+    "Telemetry": 0.12,
+    "ICU": 0.06,
+    "Women's & Peds": 0.10,
 }
-# Relative ED admission volume for each hour slot 9-10 AM ... 4-5 PM.
-ARRIVAL_PROFILE = [0.70, 0.85, 1.10, 1.20, 1.20, 1.10, 1.00, 0.90]
 # Share of the DAY's expected discharges that happen in each slot.
 # Most discharges land in the afternoon; the rest go after 5 PM.
-DISCHARGE_PROFILE = [0.01, 0.02, 0.04, 0.04, 0.06, 0.12, 0.16, 0.15]
+DISCHARGE_PROFILE = [0.01, 0.02, 0.03, 0.03, 0.04, 0.12, 0.17, 0.16]
 CLEANING_PER_HOUR = 1.0  # needs-cleaning rooms turned over per hour per unit
 AFTERNOON_START_HOUR = 14  # "after 2 PM"
 
@@ -821,7 +902,7 @@ class Forecast:
     @property
     def runout_hour(self):
         """First hour the unit has no open bed left, or None."""
-        hit = self.table[self.table["projected_open"] < 0.5]
+        hit = self.table[self.table["projected_open"] < 0]
         return int(hit["hour"].iloc[0]) if len(hit) else None
 
     @property
@@ -851,7 +932,7 @@ class Forecast:
         out = []
         day = DAY_ADJUSTMENT.get(self.day_of_week, 0)
         if day:
-            out.append(f"{self.day_of_week}: +{day:.0%} expected admissions")
+            out.append(f"{self.day_of_week}: {day:+.0%} expected admissions")
         trend = TREND_LEVELS[self.trend_level]
         if trend:
             out.append(f"Flu/RSV trend {self.trend_level.split(' ')[0]}: +{trend:.0%} expected admissions (simulated surveillance data)")
@@ -883,8 +964,10 @@ def forecast_unit(
     open now + rooms cleaned + expected discharges - expected admissions.
 
     Expected admissions = ED patients (boarders, plus workup patients weighted
-    by admit probability) + new ED arrivals by hour, scaled by day of week,
-    public health trend, and any news alerts a human applied.
+    by admit probability) + new ED arrivals by hour x 16% admit rate x the
+    unit's share of admissions, scaled by day of week, public health trend
+    (which stands in for the winter respiratory season), and any news alerts
+    a human applied.
     """
     applied_alerts = applied_alerts or []
     b = beds.set_index("unit").loc[unit]
@@ -900,12 +983,14 @@ def forecast_unit(
     workup = ed_scored[(ed_scored["status"] == "In workup") & (ed_scored["likely_bed"] == unit)]
     workup_expected = float(workup["admit_probability"].sum())
     dc_today = expected_discharges_today(unit, beds, inpatients_ranked)
+    # Typical arrivals for this weekday by hour; season is applied via trend_level.
+    arrivals_by_hour = BASE_DAILY_ARRIVALS * hourly_arrival_share(day_of_week)
 
     rows = [{"hour": FORECAST_START_HOUR, "cleaned": 0.0, "discharges": 0.0,
              "ed_admits": 0.0, "new_arrival_admits": 0.0}]
     for i in range(FORECAST_HOURS):
         prev = rows[-1]
-        ed_now = len(boarders) if i == 0 else 0  # boarders take the first beds
+        ed_now = 1.0 if i < len(boarders) else 0.0  # boarders placed one per hour as beds open
         if i in (1, 2):
             ed_now += workup_expected / 2  # workup decisions over the next 2-3 hours
         rows.append(
@@ -915,7 +1000,8 @@ def forecast_unit(
                 "discharges": prev["discharges"] + dc_today * DISCHARGE_PROFILE[i],
                 "ed_admits": prev["ed_admits"] + ed_now,
                 "new_arrival_admits": prev["new_arrival_admits"]
-                + NEW_ADMITS_PER_HOUR[unit] * ARRIVAL_PROFILE[i] * multiplier,
+                + arrivals_by_hour[FORECAST_START_HOUR + i] * ED_ADMIT_RATE
+                * UNIT_ADMIT_SHARE[unit] * multiplier,
             }
         )
     table = pd.DataFrame(rows)
@@ -940,11 +1026,11 @@ def forecast_unit(
 
 CAPACITY_TIERS = {
     "Normal": {
-        "when": "At least 3 open beds all day",
+        "when": "About 3 or more open beds all day",
         "actions": ["Routine bed huddles"],
     },
     "Level 1 — Tight": {
-        "when": "Lowest point is 1–2 open beds",
+        "when": "Gets down to 0–2 open beds but does not run out",
         "actions": [
             "Work the \"likely home today\" list first",
             "Open the discharge lounge",
@@ -953,7 +1039,7 @@ CAPACITY_TIERS = {
         ],
     },
     "Level 2 — Full": {
-        "when": "Runs out of beds, short up to 3",
+        "when": "Runs out of beds, short up to about 2",
         "actions": [
             "Open flex beds with extra nurse shifts",
             "Hallway-bed protocol for stable patients (RN approval)",
@@ -962,7 +1048,7 @@ CAPACITY_TIERS = {
         ],
     },
     "Level 3 — Crisis": {
-        "when": "Short 4 or more beds",
+        "when": "Short about 3 or more beds",
         "actions": [
             "Delay non-urgent planned surgeries (CMO approval)",
             "Transfer stable patients to partner facilities",
@@ -973,14 +1059,30 @@ CAPACITY_TIERS = {
 
 
 def recommend_tier(forecast: Forecast) -> str:
-    low = round(forecast.min_open)
-    if low >= 3:
+    """Uses the same cut-off as the run-out warning: below 0 means out of beds."""
+    low = forecast.min_open
+    if low >= 2.5:
         return "Normal"
-    if low >= 1:
+    if low >= 0:
         return "Level 1 — Tight"
-    if low >= -3:
+    if low > -2.5:
         return "Level 2 — Full"
     return "Level 3 — Crisis"
+
+
+# ---------------------------------------------------------------------------
+# Equity baseline (from the Halvian case brief; not synthetic)
+# ---------------------------------------------------------------------------
+
+HALVIAN_BASELINE = pd.DataFrame(
+    {
+        "group": ["Commercial", MEDICAID, "Uninsured", "Overall"],
+        "door_to_provider_min": [48, 58, 64, 55],
+        "lwbs_pct": [3.0, 4.6, 5.8, 4.0],
+    }
+)
+
+DATA_SOURCES_NOTE = "Synthetic data calibrated to the Halvian case brief."
 
 
 # ---------------------------------------------------------------------------
@@ -995,4 +1097,5 @@ def load_all() -> dict[str, pd.DataFrame]:
         "inpatients": generate_inpatients(),
         "past_stays": generate_past_inpatient_stays(),
         "boarding": generate_boarding_history(),
+        "ed_arrivals": generate_ed_arrivals(),
     }
