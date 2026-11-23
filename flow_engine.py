@@ -806,8 +806,23 @@ UNIT_ADMIT_SHARE = {
 # Share of the DAY's expected discharges that happen in each slot.
 # Most discharges land in the afternoon; the rest go after 5 PM.
 DISCHARGE_PROFILE = [0.01, 0.02, 0.03, 0.03, 0.04, 0.12, 0.17, 0.16]
+# Share of the day's discharges in the two slots after 5 PM (used when a
+# discharge lounge pulls discharges earlier).
+DISCHARGE_PROFILE_EVENING = [0.10, 0.08]
 CLEANING_PER_HOUR = 1.0  # needs-cleaning rooms turned over per hour per unit
 AFTERNOON_START_HOUR = 14  # "after 2 PM"
+
+
+def _discharge_share(slot: int, shift_hours: int = 0) -> float:
+    """Share of the day's discharges in forecast slot `slot`, optionally pulled
+    `shift_hours` earlier (e.g., a discharge lounge frees rooms ~2 hours sooner)."""
+    profile = DISCHARGE_PROFILE + DISCHARGE_PROFILE_EVENING
+    if shift_hours == 0:
+        return profile[slot]
+    if slot == 0:  # the first slot also absorbs the hours pulled in from before
+        return sum(profile[: shift_hours + 1])
+    j = slot + shift_hours
+    return profile[j] if j < len(profile) else 0.0
 
 
 def hour_label(hour: int) -> str:
@@ -859,7 +874,7 @@ def news_alerts() -> list[dict]:
             "headline": "Nearby hospital diverting ambulances",
             "source": "Simulated regional EMS feed",
             "detail": "A nearby hospital is on ambulance diversion until about 3 PM.",
-            "effect": {unit: 0.10 for unit in UNIT_CAPACITY},
+            "effect": {unit: 0.15 for unit in UNIT_CAPACITY},
         },
         {
             "id": "ice-storm",
@@ -966,6 +981,8 @@ def forecast_unit(
     day_of_week: str,
     trend_level: str,
     applied_alerts: list | None = None,
+    flex_beds: int = 0,
+    discharge_shift_hours: int = 0,
 ) -> Forecast:
     """Projected open beds by hour:
     open now + rooms cleaned + expected discharges - expected admissions.
@@ -1004,7 +1021,7 @@ def forecast_unit(
             {
                 "hour": FORECAST_START_HOUR + i + 1,
                 "cleaned": min(float(b["needs_cleaning"]), (i + 1) * CLEANING_PER_HOUR),
-                "discharges": prev["discharges"] + dc_today * DISCHARGE_PROFILE[i],
+                "discharges": prev["discharges"] + dc_today * _discharge_share(i, discharge_shift_hours),
                 "ed_admits": prev["ed_admits"] + ed_now,
                 "new_arrival_admits": prev["new_arrival_admits"]
                 + arrivals_by_hour[FORECAST_START_HOUR + i] * ED_ADMIT_RATE
@@ -1014,8 +1031,9 @@ def forecast_unit(
     table = pd.DataFrame(rows)
     table.insert(0, "time", table["hour"].map(hour_label))
     table.insert(2, "open_now", int(b["open"]))
+    table["flex_beds"] = [0] + [flex_beds] * FORECAST_HOURS  # flex beds open from 10 AM
     table["projected_open"] = (
-        table["open_now"] + table["cleaned"] + table["discharges"]
+        table["open_now"] + table["cleaned"] + table["discharges"] + table["flex_beds"]
         - table["ed_admits"] - table["new_arrival_admits"]
     )
     return Forecast(
@@ -1029,6 +1047,54 @@ def forecast_unit(
         ed_workup=len(workup),
         discharges_today=dc_today,
     )
+
+
+# ----- What-If: Medicine operational actions ------------------------------
+
+LOUNGE_SHIFT_HOURS = 2
+
+
+def social_barrier_patients(inpatients: pd.DataFrame, scan: dict | None) -> set:
+    """Patients with a social barrier: from the Barrier Flags scan when available,
+    otherwise from the documented social_barrier field."""
+    if scan:
+        return {pid for pid, r in scan["results"].items()
+                if any(b["type"] == "Social" for b in r["barriers"])}
+    return set(inpatients.loc[inpatients["social_barrier"] == 1, "patient_id"])
+
+
+def clear_social_barriers(model: "ExplainableLogit", inpatients_ranked: pd.DataFrame, pids: set) -> pd.DataFrame:
+    """Re-score discharge probability as if these patients' social barriers were cleared."""
+    out = inpatients_ranked.copy()
+    mask = out["patient_id"].isin(pids)
+    out.loc[mask, "social_barrier"] = 0
+    out["discharge_probability"] = model.predict_proba(out)
+    return out
+
+
+def shortage_patient_hours(forecast: Forecast) -> float:
+    """Patient-hours without a bed: each hour the unit is short, the patients
+    short are boarding in the ED."""
+    return float(np.maximum(-forecast.table["projected_open"].iloc[1:], 0).sum())
+
+
+def medicine_scenario(beds, ed_scored, inpatients_ranked, discharge_model, day_of_week, trend_level,
+                      applied_alerts, lounge: bool, clear_social: bool, flex_beds: int, scan=None) -> dict:
+    unit = "Medicine"
+    base = forecast_unit(unit, beds, ed_scored, inpatients_ranked, day_of_week, trend_level, applied_alerts)
+    pids = social_barrier_patients(inpatients_ranked, scan) if clear_social else set()
+    medicine_pids = set(inpatients_ranked.loc[inpatients_ranked["unit"] == unit, "patient_id"]) & pids
+    scen_inpatients = clear_social_barriers(discharge_model, inpatients_ranked, pids) if pids else inpatients_ranked
+    scen = forecast_unit(unit, beds, ed_scored, scen_inpatients, day_of_week, trend_level, applied_alerts,
+                         flex_beds=flex_beds, discharge_shift_hours=LOUNGE_SHIFT_HOURS if lounge else 0)
+    saved = max(shortage_patient_hours(base) - shortage_patient_hours(scen), 0.0)
+    return {
+        "base": base, "scenario": scen,
+        "boarding_hours_saved": saved,
+        "dollars_saved": saved * BOARDING_COST_PER_HOUR,
+        "medicine_social_cleared": len(medicine_pids),
+        "extra_discharges_today": scen.discharges_today - base.discharges_today,
+    }
 
 
 CAPACITY_TIERS = {
@@ -1251,7 +1317,7 @@ _KEYWORD_RULES = [
     (r"PT eval not yet completed", "PT evaluation not completed", "Medical", "Hospitalist"),
     (r"walker and 1 assist", "Needs assistance to walk", "Medical", "Case management"),
     (r"[Bb]edbound", "Bedbound, 2-person assist", "Medical", "Case management"),
-    (r"no ride home", "No ride home", "Social", "Case management"),
+    (r"no ride home", "No ride home", "Social", "Social work"),
     (r"can't afford", "Can't afford discharge medications", "Social", "Pharmacy"),
     (r"nursing-home placement", "Needs nursing-home placement", "Social", "Case management"),
     (r"shelter", "Staying at a shelter; needs a safe discharge plan", "Social", "Social work"),
@@ -1543,6 +1609,55 @@ OVERSIGHT_OWNERS = {
     "Data analyst": "Monthly monitoring",
     "AI oversight committee": "Decides to pause, retrain, or retire",
 }
+
+
+# ---------------------------------------------------------------------------
+# Silent mode, manual mode, footer
+# ---------------------------------------------------------------------------
+
+FOOTER_TEXT = ("AI recommendations only — a qualified human approves every action. "
+               "Insurance, race, and language are never model inputs. "
+               "All data is synthetic, calibrated to the Halvian case brief.")
+
+SILENT_LOG_PATH = Path(
+    os.environ.get("FOREWARD_SILENT_LOG", Path(__file__).resolve().parent / "data" / "silent_predictions.csv")
+)
+SILENT_LOG_COLUMNS = ["logged_at", "kind", "subject", "prediction", "detail"]
+
+
+def log_silent_predictions(ed_scored: pd.DataFrame, medicine_forecast: "Forecast", path: Path | None = None) -> int:
+    """Silent mode: record predictions for later validation against what happened."""
+    from datetime import datetime
+
+    path = Path(path or SILENT_LOG_PATH)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    rows = [
+        {"logged_at": now, "kind": "ED admission", "subject": r.patient_id,
+         "prediction": f"{r.admit_probability:.3f}", "detail": f"likely bed: {r.likely_bed}"}
+        for r in ed_scored.itertuples()
+    ]
+    rows.append({"logged_at": now, "kind": "Medicine forecast", "subject": "Medicine",
+                 "prediction": f"{medicine_forecast.min_open:.2f}",
+                 "detail": f"run-out: {hour_label(medicine_forecast.runout_hour) if medicine_forecast.runout_hour else 'none'}"})
+    new_file = not path.exists()
+    with path.open("a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=SILENT_LOG_COLUMNS)
+        if new_file:
+            w.writeheader()
+        w.writerows(rows)
+    return len(rows)
+
+
+MANUAL_PROTOCOL = [
+    "Declare downtime: the house supervisor announces it and notes the time.",
+    "Use this whiteboard plus the last auto-printed bed board.",
+    "Bed huddles every 2 hours (house supervisor, charge nurses, bed manager, ED charge).",
+    "Request beds by phone to the bed manager.",
+    "Record every placement and decision in the paper log.",
+    "Reconcile the paper log into the system after recovery.",
+    "Drill this protocol monthly.",
+]
 
 
 # ---------------------------------------------------------------------------

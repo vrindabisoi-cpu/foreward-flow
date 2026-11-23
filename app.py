@@ -32,6 +32,72 @@ SERIES_BLUE = "#2a78d6"
 CRITICAL_RED = "#d03b3b"
 SERIES_ORANGE = "#eb6834"
 
+HOSPITAL_BLUE = "#0b4f8a"
+
+APP_CSS = """
+<style>
+.block-container {padding-top: 2.2rem; padding-bottom: 2rem; max-width: 1400px;}
+h1, [data-testid="stHeading"] h1 {color: #0b4f8a !important; font-size: 1.85rem !important; font-weight: 700 !important;}
+h2, [data-testid="stHeading"] h2 {color: #0b4f8a !important; font-size: 1.45rem !important;}
+h3, [data-testid="stHeading"] h3 {color: #0b4f8a !important; font-size: 1.3rem !important; font-weight: 650 !important;
+    padding-top: 1.1rem !important;}
+h4, [data-testid="stHeading"] h4 {color: #0b4f8a !important; font-size: 1.1rem !important;}
+.stTabs [data-baseweb="tab-list"] {gap: 0.5rem; border-bottom: 1px solid #d6e2ef;}
+.stTabs [data-baseweb="tab"] p {font-size: 1.02rem !important; font-weight: 600 !important;}
+.stTabs [data-baseweb="tab"] {padding: 0.55rem 0.9rem;}
+[data-testid="stMetricValue"] {font-size: 1.55rem;}
+[data-testid="stMetricLabel"] p {font-weight: 600; color: #3b4b5c;}
+[data-testid="stVerticalBlockBorderWrapper"] {border-radius: 10px;}
+.ff-footer {margin-top: 2.5rem; padding: 0.9rem 1rem; border-top: 2px solid #0b4f8a;
+            color: #3b4b5c; font-size: 0.85rem; background: #f3f7fb; border-radius: 0 0 8px 8px;}
+.wb-unit {border: 1px solid #c9d6e3; border-radius: 10px; padding: 0.8rem 1rem; margin-bottom: 0.9rem;
+          break-inside: avoid; page-break-inside: avoid;}
+.wb-unit h4 {margin: 0 0 0.3rem 0;}
+.wb-counts {font-size: 0.95rem; margin-bottom: 0.5rem;}
+.wb-grid {display: grid; grid-template-columns: repeat(20, 16px); gap: 3px;}
+.wb-sq {width: 16px; height: 16px; border-radius: 3px; border: 1px solid rgba(0,0,0,0.15);
+        -webkit-print-color-adjust: exact; print-color-adjust: exact;}
+.wb-open {background: #2e9e5b;} .wb-clean {background: #f2c230;} .wb-occ {background: #d03b3b;}
+@media print {
+  [data-testid="stSidebar"], [data-testid="stHeader"], [data-testid="stToolbar"] {display: none !important;}
+  .block-container {padding-top: 0 !important; max-width: 100% !important;}
+}
+</style>
+"""
+
+
+def render_whiteboard(beds, ed):
+    """Manual mode: printable whiteboard for downtime (no predictions)."""
+    st.error("**Manual mode (whiteboard backup).** The AI tools are off. Use this board, the last "
+             "auto-printed board, and the paper log. Print with Ctrl/Cmd + P.", icon="📋")
+    st.caption(f"Board as of {fe.REFERENCE_DATE:%A %b %d, %Y}, 9:00 AM")
+    st.subheader("Beds by unit")
+    st.markdown("<span class='wb-sq wb-open' style='display:inline-block;vertical-align:middle'></span> Open &nbsp; "
+                "<span class='wb-sq wb-clean' style='display:inline-block;vertical-align:middle'></span> Needs cleaning &nbsp; "
+                "<span class='wb-sq wb-occ' style='display:inline-block;vertical-align:middle'></span> Occupied",
+                unsafe_allow_html=True)
+    cols = st.columns(2, gap="large")
+    for i, row in enumerate(beds.itertuples()):
+        squares = (["wb-open"] * row.open + ["wb-clean"] * row.needs_cleaning + ["wb-occ"] * row.occupied)
+        grid = "".join(f"<div class='wb-sq {c}'></div>" for c in squares)
+        cols[i % 2].markdown(
+            f"<div class='wb-unit'><h4>{row.unit} · {row.total_beds} beds</h4>"
+            f"<div class='wb-counts'><b>{row.open}</b> open · <b>{row.needs_cleaning}</b> needs cleaning · "
+            f"<b>{row.occupied}</b> occupied</div><div class='wb-grid'>{grid}</div></div>",
+            unsafe_allow_html=True,
+        )
+    st.subheader("ED boarding list")
+    boarders = ed[ed["status"] == "Boarding"].sort_values("hours_boarding", ascending=False)
+    st.dataframe(
+        boarders[["patient_id", "bed", "age", "chief_complaint", "admit_unit", "hours_boarding"]],
+        hide_index=True, width="stretch",
+        column_config={"patient_id": "Patient", "bed": "ED bed", "age": "Age", "chief_complaint": "Complaint",
+                       "admit_unit": "Admitted to",
+                       "hours_boarding": st.column_config.NumberColumn("Hours boarding", format="%.1f")},
+    )
+    st.subheader("Manual protocol")
+    st.markdown("\n".join(f"{i}. {step}" for i, step in enumerate(fe.MANUAL_PROTOCOL, start=1)))
+
 
 @st.cache_data
 def load_data():
@@ -143,6 +209,7 @@ def run_scan():
 decision_log = fe.read_decision_log()
 # Forecast uses the ED list with physician overrides applied (display tables keep the AI view).
 ed_forecast, physician_overrides = fe.apply_physician_overrides(ed, decision_log)
+applied_alerts = [a for a in alerts if alert_status(decision_log, a) == "Applied to forecast"]
 
 
 def decide_action(role, decision, action, context):
@@ -162,6 +229,12 @@ def review_alert(role, alert, decision):
 
 # --- Sidebar ---------------------------------------------------------------------
 with st.sidebar:
+    st.header("Mode")
+    silent = st.toggle("Silent mode (Phase 1 pilot)", key="silent_mode",
+                       help="Hides all predictions, forecasts, tiers, and AI suggestions from staff.")
+    manual = st.toggle("Manual mode (whiteboard backup)", key="manual_mode",
+                       help="Replaces the app with a printable whiteboard for downtime.")
+
     st.header("Your role")
     role = st.selectbox("Acting as", ROLES, index=0)
     is_owner = role == DECISION_OWNER
@@ -220,8 +293,26 @@ with st.sidebar:
         "they're kept only for fairness checks."
     )
 
+st.markdown(APP_CSS, unsafe_allow_html=True)
 st.title(fe.HOSPITAL_NAME)
 st.caption("Synthetic data only — not real patients")
+
+
+def footer():
+    st.markdown(f"<div class='ff-footer'>{fe.FOOTER_TEXT}</div>", unsafe_allow_html=True)
+
+
+if manual:
+    render_whiteboard(beds, ed)
+    footer()
+    st.stop()
+
+if silent:
+    st.warning("**Silent mode: predictions are logged for validation only and hidden from staff.**", icon="🔇")
+    if st.session_state.get("silent_logged") != str(fe.REFERENCE_DATE.date()):
+        med = fe.forecast_unit("Medicine", beds, ed_forecast, ranked, day_of_week, trend_level, applied_alerts)
+        fe.log_silent_predictions(ed, med)
+        st.session_state["silent_logged"] = str(fe.REFERENCE_DATE.date())
 
 if "flash" in st.session_state:
     st.error(st.session_state.pop("flash"))
@@ -266,6 +357,7 @@ with tab_control:
         st.markdown(f"🪑 **{fe.WAITING_ROOM_PATIENTS}** patients waiting")
         st.caption(f"{fe.WAITING_ROOM_SEATS} seats")
 
+    st.subheader("ED boarding")
     bm = fe.boarding_metrics(ed)
     c1, c2, c3 = st.columns(3)
     c1.metric("Admitted patients boarding", bm["patients"])
@@ -273,202 +365,205 @@ with tab_control:
     c3.metric("Today's boarding cost", f"${bm['cost']:,.0f}")
     st.caption(f"Cost estimate: ${fe.BOARDING_COST_PER_HOUR} per boarding hour.")
 
-    # --- 8-hour forecast ------------------------------------------------------------
-    st.subheader("8-hour bed forecast (9 AM–5 PM)")
-    units = list(fe.UNIT_CAPACITY)
-    unit = st.selectbox("Unit", units, index=units.index("Medicine"))
-    applied = [a for a in alerts if alert_status(decision_log, a) == "Applied to forecast"]
-    forecast = fe.forecast_unit(unit, beds, ed_forecast, ranked, day_of_week, trend_level, applied)
-    tier = fe.recommend_tier(forecast)
+    if silent:
+        st.info("Hidden in silent mode (Phase 1 pilot): predictions are logged for validation only.", icon="🔇")
+    else:
+        # --- 8-hour forecast ------------------------------------------------------------
+        st.subheader("8-hour bed forecast (9 AM–5 PM)")
+        units = list(fe.UNIT_CAPACITY)
+        unit = st.selectbox("Unit", units, index=units.index("Medicine"))
+        applied = [a for a in alerts if alert_status(decision_log, a) == "Applied to forecast"]
+        forecast = fe.forecast_unit(unit, beds, ed_forecast, ranked, day_of_week, trend_level, applied)
+        tier = fe.recommend_tier(forecast)
 
-    warning = forecast.warning()
-    left, right = st.columns([3, 1])
-    with left:
-        if warning:
-            st.error(
-                f"**{warning}**\n\n**Why:**\n"
-                + "\n".join(f"- {r}" for r in forecast.reasons()),
-                icon="⚠️",
-            )
-        else:
-            st.success(
-                f"**{unit} projected to keep open beds through 5 PM** "
-                f"(lowest point: about {max(forecast.min_open, 0):.0f})",
-                icon="✅",
-            )
-    with right:
-        if forecast.head_start_hours is not None:
-            hs = forecast.head_start_hours
-            st.markdown(f"### ⏱️ {hs}-hour head start" if hs else "### ⏱️ No head start")
-            st.caption(f"From the 9 AM forecast to the projected {fe.hour_label(forecast.runout_hour)} run-out.")
-        st.metric("Expected admissions adjustment", f"+{forecast.admission_adjustment:.0%}")
-    unit_overrides = [o for o in physician_overrides if unit in (o["from"], o["to"])]
-    if unit_overrides:
-        st.info(
-            "**Forecast updated by physician override.** "
-            + "; ".join(f"{o['patient_id']}: {o['from']} → {o['to']}" for o in unit_overrides),
-            icon="🩺",
-        )
-
-    chart_df = forecast.table.assign(projected_open=lambda d: d["projected_open"].round(1))
-    x = alt.X("hour:O", title=None, sort=None, axis=alt.Axis(labelExpr=
-        "datum.value < 12 ? datum.value + ' AM' : (datum.value == 12 ? '12 PM' : (datum.value - 12) + ' PM')",
-        labelAngle=0))
-    hover = alt.selection_point(fields=["hour"], nearest=True, on="pointerover", empty=False)
-    line = alt.Chart(chart_df).mark_line(color=SERIES_BLUE, strokeWidth=2).encode(
-        x=x, y=alt.Y("projected_open:Q", title="Projected open beds")
-    )
-    points = alt.Chart(chart_df).mark_point(filled=True, size=70, color=SERIES_BLUE).encode(
-        x=x,
-        y="projected_open:Q",
-        opacity=alt.condition(hover, alt.value(1), alt.value(0.35)),
-        tooltip=[
-            alt.Tooltip("time:N", title="Time"),
-            alt.Tooltip("projected_open:Q", title="Projected open beds", format=".1f"),
-            alt.Tooltip("cleaned:Q", title="Rooms cleaned", format=".0f"),
-            alt.Tooltip("discharges:Q", title="Expected discharges", format=".1f"),
-            alt.Tooltip("ed_admits:Q", title="ED patients admitted", format=".1f"),
-            alt.Tooltip("new_arrival_admits:Q", title="New-arrival admissions", format=".1f"),
-        ],
-    ).add_params(hover)
-    zero = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color=CRITICAL_RED, strokeDash=[4, 3]).encode(y="y:Q")
-    zero_label = alt.Chart(pd.DataFrame({"y": [0], "label": ["No open beds"]})).mark_text(
-        align="left", dx=4, dy=-6, color=CRITICAL_RED, fontSize=11
-    ).encode(y="y:Q", text="label:N", x=alt.value(0))
-    st.altair_chart((zero + zero_label + line + points).properties(height=280), width="stretch")
-    st.caption(
-        "Projected open beds = open now + rooms cleaned + expected discharges "
-        "(likely-home-today model) − expected admissions (ED patients from the admission "
-        "model + new arrivals by hour)."
-    )
-    with st.expander("Forecast table"):
-        st.dataframe(
-            forecast.table.drop(columns="hour").round(1),
-            hide_index=True,
-            width="stretch",
-            column_config={
-                "time": "Time",
-                "open_now": "Open now",
-                "cleaned": "Rooms cleaned",
-                "discharges": "Expected discharges",
-                "ed_admits": "ED patients admitted",
-                "new_arrival_admits": "New-arrival admissions",
-                "projected_open": "Projected open beds",
-            },
-        )
-
-    with st.expander("All units at a glance"):
-        overview = []
-        for u in units:
-            f = fe.forecast_unit(u, beds, ed_forecast, ranked, day_of_week, trend_level, applied)
-            overview.append(
-                {
-                    "Unit": u,
-                    "Lowest projected open beds": round(f.min_open, 1),
-                    "At": fe.hour_label(f.worst_hour),
-                    "Runs out by": fe.hour_label(f.runout_hour) if f.runout_hour else "—",
-                    "Recommended tier": fe.recommend_tier(f),
-                }
-            )
-        st.dataframe(pd.DataFrame(overview), hide_index=True, width="stretch")
-
-    # --- Capacity tiers & decisions ---------------------------------------------------
-    st.subheader("Recommended capacity tier")
-    tier_info = fe.CAPACITY_TIERS[tier]
-    icon = {"Normal": "✅", "Level 1 — Tight": "🟡", "Level 2 — Full": "🟠", "Level 3 — Crisis": "🔴"}[tier]
-    st.markdown(f"### {icon} {unit}: {tier}")
-    st.caption(f"Why this tier: {fe.tier_rationale(forecast)}")
-    st.markdown(f"**Decision owner: {DECISION_OWNER}**")
-
-    context = f"{unit} · {tier} · {day_of_week} · {trend_level}"
-    latest = {}
-    for entry in decision_log[decision_log["context"] == context].to_dict("records"):
-        latest[entry["item"]] = entry
-
-    st.text_input(
-        "Reason for your decision (required to decline)",
-        key="action_reason",
-        disabled=not is_owner,
-        placeholder="e.g. Discharge lounge already open since 8 AM",
-    )
-    for i, action in enumerate(tier_info["actions"]):
-        a_col, s_col, ok_col, no_col = st.columns([5, 2, 1, 1])
-        a_col.markdown(f"**{action}**")
-        if action in latest:
-            e = latest[action]
-            mark = "✅ Approved" if e["decision"] == "Approved" else "❌ Declined"
-            s_col.caption(f"{mark} · {e['time'][11:16]}")
-        else:
-            s_col.caption("Awaiting decision")
-        ok_col.button(
-            "Approve", key=f"approve_{i}", disabled=not is_owner, type="primary",
-            on_click=decide_action, args=(role, "Approved", action, context),
-        )
-        no_col.button(
-            "Decline", key=f"decline_{i}", disabled=not is_owner,
-            on_click=decide_action, args=(role, "Declined", action, context),
-        )
-
-    with st.expander("All capacity tiers"):
-        for name, info in fe.CAPACITY_TIERS.items():
-            marker = " ← recommended" if name == tier else ""
-            st.markdown(f"**{name}**{marker} — {info['when']}")
-            st.markdown("\n".join(f"- {a}" for a in info["actions"]))
-
-    # --- Public health & news alerts ------------------------------------------------------
-    st.subheader("Public health & news alerts")
-    ph_col, news_col = st.columns(2)
-    with ph_col, st.container(border=True):
-        st.markdown("**Official public health data**")
-        st.caption(f"{feed['source']}, as of {feed['as_of']}.")
-        loc, nat = feed["local"], feed["national"]
-        c1, c2 = st.columns(2)
-        c1.metric("Local flu/RSV level", loc["level"].replace(" flu/RSV", ""), loc["trend"], delta_color="inverse")
-        c1.caption(f"Flu {loc['flu_ed_visits_pct']}% · RSV {loc['rsv_ed_visits_pct']}% of ED visits")
-        c2.metric("National level", nat["level"], nat["trend"], delta_color="inverse")
-        c2.caption(f"Flu {nat['flu_ed_visits_pct']}% · RSV {nat['rsv_ed_visits_pct']}% of ED visits")
-        if trend_level == feed_level:
-            st.info(
-                f"Applied automatically: local level **{feed_level}** adds "
-                f"**+{fe.TREND_LEVELS[feed_level]:.0%}** to expected admissions."
-            )
-        else:
-            st.warning(
-                f"Manual override: forecast uses **{trend_level}** instead of the "
-                f"surveillance level ({feed_level})."
-            )
-
-    with news_col, st.container(border=True):
-        st.markdown("**News alerts — for house supervisor review**")
-        st.caption("Simulated news. Alerts never change the forecast unless a person applies them.")
-        for alert in alerts:
-            status = alert_status(decision_log, alert)
-            effect = ", ".join(f"{u} +{p:.0%}" for u, p in alert["effect"].items())
-            if len(alert["effect"]) == len(fe.UNIT_CAPACITY):
-                effect = f"all units +{next(iter(alert['effect'].values())):.0%}"
-            body = (
-                f"**{alert['headline']}**  \n{alert['detail']}  \n"
-                f"*{alert['source']}* · If applied: {effect} expected admissions  \n"
-                f"Status: **{status}**"
-            )
-            if status == "Pending review":
-                st.warning(body, icon="📰")
-                st.text_input(
-                    "Reason (required to dismiss)", key=f"alert_reason_{alert['id']}",
-                    disabled=not is_owner, label_visibility="collapsed",
-                    placeholder="Reason (required to dismiss)",
-                )
-                b1, b2 = st.columns(2)
-                b1.button(
-                    "Apply to forecast", key=f"apply_{alert['id']}", disabled=not is_owner,
-                    on_click=review_alert, args=(role, alert, "Applied to forecast"), width="stretch",
-                )
-                b2.button(
-                    "Dismiss", key=f"dismiss_{alert['id']}", disabled=not is_owner,
-                    on_click=review_alert, args=(role, alert, "Dismissed"), width="stretch",
+        warning = forecast.warning()
+        left, right = st.columns([3, 1])
+        with left:
+            if warning:
+                st.error(
+                    f"**{warning}**\n\n**Why:**\n"
+                    + "\n".join(f"- {r}" for r in forecast.reasons()),
+                    icon="⚠️",
                 )
             else:
-                st.info(body, icon="✅" if status == "Applied to forecast" else "🗑️")
+                st.success(
+                    f"**{unit} projected to keep open beds through 5 PM** "
+                    f"(lowest point: about {max(forecast.min_open, 0):.0f})",
+                    icon="✅",
+                )
+        with right:
+            if forecast.head_start_hours is not None:
+                hs = forecast.head_start_hours
+                st.markdown(f"### ⏱️ {hs}-hour head start" if hs else "### ⏱️ No head start")
+                st.caption(f"From the 9 AM forecast to the projected {fe.hour_label(forecast.runout_hour)} run-out.")
+            st.metric("Expected admissions adjustment", f"+{forecast.admission_adjustment:.0%}")
+        unit_overrides = [o for o in physician_overrides if unit in (o["from"], o["to"])]
+        if unit_overrides:
+            st.info(
+                "**Forecast updated by physician override.** "
+                + "; ".join(f"{o['patient_id']}: {o['from']} → {o['to']}" for o in unit_overrides),
+                icon="🩺",
+            )
+
+        chart_df = forecast.table.assign(projected_open=lambda d: d["projected_open"].round(1))
+        x = alt.X("hour:O", title=None, sort=None, axis=alt.Axis(labelExpr=
+            "datum.value < 12 ? datum.value + ' AM' : (datum.value == 12 ? '12 PM' : (datum.value - 12) + ' PM')",
+            labelAngle=0))
+        hover = alt.selection_point(fields=["hour"], nearest=True, on="pointerover", empty=False)
+        line = alt.Chart(chart_df).mark_line(color=SERIES_BLUE, strokeWidth=2).encode(
+            x=x, y=alt.Y("projected_open:Q", title="Projected open beds")
+        )
+        points = alt.Chart(chart_df).mark_point(filled=True, size=70, color=SERIES_BLUE).encode(
+            x=x,
+            y="projected_open:Q",
+            opacity=alt.condition(hover, alt.value(1), alt.value(0.35)),
+            tooltip=[
+                alt.Tooltip("time:N", title="Time"),
+                alt.Tooltip("projected_open:Q", title="Projected open beds", format=".1f"),
+                alt.Tooltip("cleaned:Q", title="Rooms cleaned", format=".0f"),
+                alt.Tooltip("discharges:Q", title="Expected discharges", format=".1f"),
+                alt.Tooltip("ed_admits:Q", title="ED patients admitted", format=".1f"),
+                alt.Tooltip("new_arrival_admits:Q", title="New-arrival admissions", format=".1f"),
+            ],
+        ).add_params(hover)
+        zero = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color=CRITICAL_RED, strokeDash=[4, 3]).encode(y="y:Q")
+        zero_label = alt.Chart(pd.DataFrame({"y": [0], "label": ["No open beds"]})).mark_text(
+            align="left", dx=4, dy=-6, color=CRITICAL_RED, fontSize=11
+        ).encode(y="y:Q", text="label:N", x=alt.value(0))
+        st.altair_chart((zero + zero_label + line + points).properties(height=280), width="stretch")
+        st.caption(
+            "Projected open beds = open now + rooms cleaned + expected discharges "
+            "(likely-home-today model) − expected admissions (ED patients from the admission "
+            "model + new arrivals by hour)."
+        )
+        with st.expander("Forecast table"):
+            st.dataframe(
+                forecast.table.drop(columns="hour").round(1),
+                hide_index=True,
+                width="stretch",
+                column_config={
+                    "time": "Time",
+                    "open_now": "Open now",
+                    "cleaned": "Rooms cleaned",
+                    "discharges": "Expected discharges",
+                    "ed_admits": "ED patients admitted",
+                    "new_arrival_admits": "New-arrival admissions",
+                    "projected_open": "Projected open beds",
+                },
+            )
+
+        with st.expander("All units at a glance"):
+            overview = []
+            for u in units:
+                f = fe.forecast_unit(u, beds, ed_forecast, ranked, day_of_week, trend_level, applied)
+                overview.append(
+                    {
+                        "Unit": u,
+                        "Lowest projected open beds": round(f.min_open, 1),
+                        "At": fe.hour_label(f.worst_hour),
+                        "Runs out by": fe.hour_label(f.runout_hour) if f.runout_hour else "—",
+                        "Recommended tier": fe.recommend_tier(f),
+                    }
+                )
+            st.dataframe(pd.DataFrame(overview), hide_index=True, width="stretch")
+
+        # --- Capacity tiers & decisions ---------------------------------------------------
+        st.subheader("Recommended capacity tier")
+        tier_info = fe.CAPACITY_TIERS[tier]
+        icon = {"Normal": "✅", "Level 1 — Tight": "🟡", "Level 2 — Full": "🟠", "Level 3 — Crisis": "🔴"}[tier]
+        st.markdown(f"### {icon} {unit}: {tier}")
+        st.caption(f"Why this tier: {fe.tier_rationale(forecast)}")
+        st.markdown(f"**Decision owner: {DECISION_OWNER}**")
+
+        context = f"{unit} · {tier} · {day_of_week} · {trend_level}"
+        latest = {}
+        for entry in decision_log[decision_log["context"] == context].to_dict("records"):
+            latest[entry["item"]] = entry
+
+        st.text_input(
+            "Reason for your decision (required to decline)",
+            key="action_reason",
+            disabled=not is_owner,
+            placeholder="e.g. Discharge lounge already open since 8 AM",
+        )
+        for i, action in enumerate(tier_info["actions"]):
+            a_col, s_col, ok_col, no_col = st.columns([5, 2, 1, 1])
+            a_col.markdown(f"**{action}**")
+            if action in latest:
+                e = latest[action]
+                mark = "✅ Approved" if e["decision"] == "Approved" else "❌ Declined"
+                s_col.caption(f"{mark} · {e['time'][11:16]}")
+            else:
+                s_col.caption("Awaiting decision")
+            ok_col.button(
+                "Approve", key=f"approve_{i}", disabled=not is_owner, type="primary",
+                on_click=decide_action, args=(role, "Approved", action, context),
+            )
+            no_col.button(
+                "Decline", key=f"decline_{i}", disabled=not is_owner,
+                on_click=decide_action, args=(role, "Declined", action, context),
+            )
+
+        with st.expander("All capacity tiers"):
+            for name, info in fe.CAPACITY_TIERS.items():
+                marker = " ← recommended" if name == tier else ""
+                st.markdown(f"**{name}**{marker} — {info['when']}")
+                st.markdown("\n".join(f"- {a}" for a in info["actions"]))
+
+        # --- Public health & news alerts ------------------------------------------------------
+        st.subheader("Public health & news alerts")
+        ph_col, news_col = st.columns(2)
+        with ph_col, st.container(border=True):
+            st.markdown("**Official public health data**")
+            st.caption(f"{feed['source']}, as of {feed['as_of']}.")
+            loc, nat = feed["local"], feed["national"]
+            c1, c2 = st.columns(2)
+            c1.metric("Local flu/RSV level", loc["level"].replace(" flu/RSV", ""), loc["trend"], delta_color="inverse")
+            c1.caption(f"Flu {loc['flu_ed_visits_pct']}% · RSV {loc['rsv_ed_visits_pct']}% of ED visits")
+            c2.metric("National level", nat["level"], nat["trend"], delta_color="inverse")
+            c2.caption(f"Flu {nat['flu_ed_visits_pct']}% · RSV {nat['rsv_ed_visits_pct']}% of ED visits")
+            if trend_level == feed_level:
+                st.info(
+                    f"Applied automatically: local level **{feed_level}** adds "
+                    f"**+{fe.TREND_LEVELS[feed_level]:.0%}** to expected admissions."
+                )
+            else:
+                st.warning(
+                    f"Manual override: forecast uses **{trend_level}** instead of the "
+                    f"surveillance level ({feed_level})."
+                )
+
+        with news_col, st.container(border=True):
+            st.markdown("**News alerts — for house supervisor review**")
+            st.caption("Simulated news. Alerts never change the forecast unless a person applies them.")
+            for alert in alerts:
+                status = alert_status(decision_log, alert)
+                effect = ", ".join(f"{u} +{p:.0%}" for u, p in alert["effect"].items())
+                if len(alert["effect"]) == len(fe.UNIT_CAPACITY):
+                    effect = f"all units +{next(iter(alert['effect'].values())):.0%}"
+                body = (
+                    f"**{alert['headline']}**  \n{alert['detail']}  \n"
+                    f"*{alert['source']}* · If applied: {effect} expected admissions  \n"
+                    f"Status: **{status}**"
+                )
+                if status == "Pending review":
+                    st.warning(body, icon="📰")
+                    st.text_input(
+                        "Reason (required to dismiss)", key=f"alert_reason_{alert['id']}",
+                        disabled=not is_owner, label_visibility="collapsed",
+                        placeholder="Reason (required to dismiss)",
+                    )
+                    b1, b2 = st.columns(2)
+                    b1.button(
+                        "Apply to forecast", key=f"apply_{alert['id']}", disabled=not is_owner,
+                        on_click=review_alert, args=(role, alert, "Applied to forecast"), width="stretch",
+                    )
+                    b2.button(
+                        "Dismiss", key=f"dismiss_{alert['id']}", disabled=not is_owner,
+                        on_click=review_alert, args=(role, alert, "Dismissed"), width="stretch",
+                    )
+                else:
+                    st.info(body, icon="✅" if status == "Applied to forecast" else "🗑️")
 
     # --- Recent decisions ----------------------------------------------------------------------
     st.subheader("Recent decisions")
@@ -516,29 +611,32 @@ with tab_ed:
                     st.markdown(f":red[**{hours}**]" if row.hours_boarding > 2 else f"**{hours}**")
                 else:
                     st.caption(f"In workup · {row.hours_in_ed:.1f} h in ED")
-            with model_col:
-                st.progress(float(row.admit_probability), text=f"Admit probability: **{row.admit_probability:.0%}**")
-                reasons = [r for r in row.top_reasons.split("; ") if r]
-                st.markdown("Top reasons:\n" + "\n".join(f"- {r}" for r in reasons) if reasons else "No strong reasons")
-            with bed_col:
-                st.markdown(f"Likely bed type: **{row.likely_bed}**")
-                st.caption(f"Bed rule: {row.bed_rule}")
-                last = place_status(pid)
-                if last is not None:
-                    mark = "✅" if last["decision"] == "Accepted" else "✏️"
-                    st.markdown(f"{mark} **{last['decision']}** by {last['role']} · {last['time'][11:16]}")
-                    st.caption(f"{last['item'].split(': ', 1)[-1]} · {last['reason']}")
-                b1, b2 = st.columns(2)
-                b1.button("Accept", key=f"accept_{pid}", type="primary", disabled=not can_place,
-                          on_click=accept_bed, args=(role, pid, row.likely_bed, row.bed_rule), width="stretch")
-                with b2.popover("Override", disabled=not can_place, width="stretch"):
-                    st.selectbox("Corrected bed type", OVERRIDE_BED_TYPES, key=f"ov_bed_{pid}",
-                                 index=None, placeholder="Choose bed type")
-                    st.selectbox("Reason", OVERRIDE_REASONS, key=f"ov_reason_{pid}",
-                                 index=None, placeholder="Choose reason")
-                    st.text_input("Note (required for Other)", key=f"ov_note_{pid}")
-                    st.button("Submit override", key=f"ov_submit_{pid}", type="primary",
-                              on_click=override_bed, args=(role, pid, row.likely_bed))
+            if silent:
+                model_col.caption("AI prediction hidden (silent mode)")
+            else:
+                with model_col:
+                    st.progress(float(row.admit_probability), text=f"Admit probability: **{row.admit_probability:.0%}**")
+                    reasons = [r for r in row.top_reasons.split("; ") if r]
+                    st.markdown("Top reasons:\n" + "\n".join(f"- {r}" for r in reasons) if reasons else "No strong reasons")
+                with bed_col:
+                    st.markdown(f"Likely bed type: **{row.likely_bed}**")
+                    st.caption(f"Bed rule: {row.bed_rule}")
+                    last = place_status(pid)
+                    if last is not None:
+                        mark = "✅" if last["decision"] == "Accepted" else "✏️"
+                        st.markdown(f"{mark} **{last['decision']}** by {last['role']} · {last['time'][11:16]}")
+                        st.caption(f"{last['item'].split(': ', 1)[-1]} · {last['reason']}")
+                    b1, b2 = st.columns(2)
+                    b1.button("Accept", key=f"accept_{pid}", type="primary", disabled=not can_place,
+                              on_click=accept_bed, args=(role, pid, row.likely_bed, row.bed_rule), width="stretch")
+                    with b2.popover("Override", disabled=not can_place, width="stretch"):
+                        st.selectbox("Corrected bed type", OVERRIDE_BED_TYPES, key=f"ov_bed_{pid}",
+                                     index=None, placeholder="Choose bed type")
+                        st.selectbox("Reason", OVERRIDE_REASONS, key=f"ov_reason_{pid}",
+                                     index=None, placeholder="Choose reason")
+                        st.text_input("Note (required for Other)", key=f"ov_note_{pid}")
+                        st.button("Submit override", key=f"ov_submit_{pid}", type="primary",
+                                  on_click=override_bed, args=(role, pid, row.likely_bed))
 
 
 # =====================================================================================
@@ -546,185 +644,245 @@ with tab_ed:
 # =====================================================================================
 with tab_barriers:
     st.subheader("Barrier Flags")
-    st.caption("Inpatients ranked by how likely they are to go home today. "
-               "Scan the notes to flag what is holding each discharge up.")
-    if not can_assign:
-        st.caption(f"Acting as {role}: view only. Only {' or '.join(ASSIGN_ROLES)} can assign barriers.")
+    if silent:
+        st.info("Hidden in silent mode (Phase 1 pilot): predictions are logged for validation only.", icon="🔇")
+    else:
+        st.caption("Inpatients ranked by how likely they are to go home today. "
+                   "Scan the notes to flag what is holding each discharge up.")
+        if not can_assign:
+            st.caption(f"Acting as {role}: view only. Only {' or '.join(ASSIGN_ROLES)} can assign barriers.")
 
-    scan_col, info_col = st.columns([1, 3])
-    scan_col.button("Scan notes with AI", key="scan_notes", type="primary", on_click=run_scan, width="stretch")
-    scan = st.session_state.get("barrier_scan")
-    with info_col:
-        if scan is None:
-            st.caption(
-                f"Will use: **{fe.SOURCE_CLAUDE if api_key else fe.SOURCE_OFFLINE}**"
-                + (f" ({model_name}, key from {key_source})" if api_key else " (no API key)")
+        scan_col, info_col = st.columns([1, 3])
+        scan_col.button("Scan notes with AI", key="scan_notes", type="primary", on_click=run_scan, width="stretch")
+        scan = st.session_state.get("barrier_scan")
+        with info_col:
+            if scan is None:
+                st.caption(
+                    f"Will use: **{fe.SOURCE_CLAUDE if api_key else fe.SOURCE_OFFLINE}**"
+                    + (f" ({model_name}, key from {key_source})" if api_key else " (no API key)")
+                )
+            elif scan["n_offline"] == 0:
+                st.success(f"Source: **{fe.SOURCE_CLAUDE}** · {scan['model']} · all {scan['n_claude']} notes", icon="🤖")
+            elif scan["n_claude"] == 0:
+                why = "no API key" if not scan["errors"] else "; ".join(scan["errors"])
+                st.warning(f"Source: **{fe.SOURCE_OFFLINE}** (keyword rules) for all {scan['n_offline']} notes · {why}",
+                           icon="🔌")
+            else:
+                st.warning(
+                    f"Source: **{fe.SOURCE_CLAUDE}** for {scan['n_claude']} notes, **{fe.SOURCE_OFFLINE}** for "
+                    f"{scan['n_offline']} ({'; '.join(scan['errors'])})", icon="⚠️",
+                )
+
+        if scan is not None:
+            summary = fe.barrier_summary(ranked, scan)
+            t1, t2, t3 = st.columns(3)
+            t1.metric("Patients with social barriers", int(summary["social"].sum()))
+            t2.metric("Patients with medical barriers", int(summary["medical"].sum()))
+            t3.metric("Patients scanned", len(summary))
+            st.markdown(
+                f"**{int(summary['social'].sum())} patients with social barriers, "
+                f"{int(summary['medical'].sum())} with medical.**"
             )
-        elif scan["n_offline"] == 0:
-            st.success(f"Source: **{fe.SOURCE_CLAUDE}** · {scan['model']} · all {scan['n_claude']} notes", icon="🤖")
-        elif scan["n_claude"] == 0:
-            why = "no API key" if not scan["errors"] else "; ".join(scan["errors"])
-            st.warning(f"Source: **{fe.SOURCE_OFFLINE}** (keyword rules) for all {scan['n_offline']} notes · {why}",
-                       icon="🔌")
-        else:
-            st.warning(
-                f"Source: **{fe.SOURCE_CLAUDE}** for {scan['n_claude']} notes, **{fe.SOURCE_OFFLINE}** for "
-                f"{scan['n_offline']} ({'; '.join(scan['errors'])})", icon="⚠️",
+
+            chart_df = fe.social_barrier_by_insurance(summary)
+            chart_df["label"] = chart_df["insurance"] + " (n=" + chart_df["patients"].astype(str) + ")"
+            bars = alt.Chart(chart_df).mark_bar(color=SOCIAL_ORANGE, cornerRadiusEnd=4, size=22).encode(
+                y=alt.Y("label:N", title=None, sort=None, axis=alt.Axis(labelLimit=220)),
+                x=alt.X("pct_social:Q", title="% of scanned patients with a social barrier",
+                        scale=alt.Scale(domain=[0, 100])),
+                tooltip=[alt.Tooltip("insurance:N", title="Insurance"),
+                         alt.Tooltip("patients:Q", title="Patients scanned"),
+                         alt.Tooltip("with_social:Q", title="With a social barrier"),
+                         alt.Tooltip("pct_social:Q", title="%", format=".0f")],
             )
+            text = bars.mark_text(align="left", dx=4, color="gray").encode(text=alt.Text("pct_social:Q", format=".0f"))
+            st.altair_chart((bars + text).properties(height=34 * len(chart_df) + 30), width="stretch")
+            st.caption("Help is routed by documented need, never by insurance type. Clearing these barriers early "
+                       "frees beds sooner and helps the groups that board longest.")
 
-    if scan is not None:
-        summary = fe.barrier_summary(ranked, scan)
-        t1, t2, t3 = st.columns(3)
-        t1.metric("Patients with social barriers", int(summary["social"].sum()))
-        t2.metric("Patients with medical barriers", int(summary["medical"].sum()))
-        t3.metric("Patients scanned", len(summary))
-        st.markdown(
-            f"**{int(summary['social'].sum())} patients with social barriers, "
-            f"{int(summary['medical'].sum())} with medical.**"
-        )
+        bar_log = decision_log[decision_log["context"] == "Barrier Flags"]
+        show = st.radio("Show:", ["All", "Only patients with barriers", "Social only"], index=1,
+                        horizontal=True, key="barrier_filter")
+        if scan is None and show != "All":
+            st.caption("Showing all patients until notes are scanned.")
 
-        chart_df = fe.social_barrier_by_insurance(summary)
-        chart_df["label"] = chart_df["insurance"] + " (n=" + chart_df["patients"].astype(str) + ")"
-        bars = alt.Chart(chart_df).mark_bar(color=SOCIAL_ORANGE, cornerRadiusEnd=4, size=22).encode(
-            y=alt.Y("label:N", title=None, sort=None),
-            x=alt.X("pct_social:Q", title="% of scanned patients with a social barrier",
-                    scale=alt.Scale(domain=[0, 100])),
-            tooltip=[alt.Tooltip("insurance:N", title="Insurance"),
-                     alt.Tooltip("patients:Q", title="Patients scanned"),
-                     alt.Tooltip("with_social:Q", title="With a social barrier"),
-                     alt.Tooltip("pct_social:Q", title="%", format=".0f")],
-        )
-        text = bars.mark_text(align="left", dx=4, color="gray").encode(text=alt.Text("pct_social:Q", format=".0f"))
-        st.altair_chart((bars + text).properties(height=34 * len(chart_df) + 30), width="stretch")
-        st.caption("Help is routed by documented need, never by insurance type. Clearing these barriers early "
-                   "frees beds sooner and helps the groups that board longest.")
+        def keep(pid):
+            if scan is None or show == "All":
+                return True
+            kinds = {b["type"] for b in scan["results"].get(pid, {}).get("barriers", [])}
+            return bool(kinds) if show == "Only patients with barriers" else "Social" in kinds
 
-    bar_log = decision_log[decision_log["context"] == "Barrier Flags"]
-    show = st.radio("Show:", ["All", "Only patients with barriers", "Social only"], index=1,
-                    horizontal=True, key="barrier_filter")
-    if scan is None and show != "All":
-        st.caption("Showing all patients until notes are scanned.")
-
-    def keep(pid):
-        if scan is None or show == "All":
-            return True
-        kinds = {b["type"] for b in scan["results"].get(pid, {}).get("barriers", [])}
-        return bool(kinds) if show == "Only patients with barriers" else "Social" in kinds
-
-    shown = 0
-    for rank, row in enumerate(ranked.itertuples(), start=1):
-        pid = row.patient_id
-        if not keep(pid):
-            continue
-        shown += 1
-        with st.container(border=True):
-            head, prob = st.columns([2, 3])
-            head.markdown(f"**#{rank} · {pid}** · {row.unit} {row.room} · age {row.age}")
-            prob.progress(float(row.discharge_probability),
-                          text=f"Likely home today: **{row.discharge_probability:.0%}**")
-            st.caption(f"For: {row.reasons_for or '—'}  ·  Against: {row.reasons_against or '—'}")
-            if scan is not None and pid in scan["results"]:
-                r = scan["results"][pid]
-                if not r["barriers"]:
-                    st.caption(f"No barriers flagged · {r['source']}")
-                for j, b in enumerate(r["barriers"]):
-                    badge = ":orange-badge[Social]" if b["type"] == "Social" else ":blue-badge[Medical]"
-                    item = f"{pid}: {b['barrier']}"
-                    done = bar_log[bar_log["item"] == item]
-                    flag_col, btn_col = st.columns([4, 2])
-                    flag_col.markdown(f"{badge} {b['barrier']} · suggested owner: **{b['owner']}**  \n"
-                                      f":gray[{r['source']}]")
-                    if len(done):
-                        e = done.iloc[-1]
-                        btn_col.caption(f"✅ Assigned to {b['owner']} by {e['role']} · {e['time'][11:16]}")
-                    else:
-                        btn_col.button(f"Assign to {b['owner']}", key=f"assign_{pid}_{j}", disabled=not can_assign,
-                                       on_click=assign_barrier, args=(role, pid, b, r["source"]), width="stretch")
-            with st.expander("Note"):
-                st.write(row.nurse_note)
-    if scan is not None:
-        st.caption(f"Showing {shown} of {len(ranked)} patients.")
+        shown = 0
+        for rank, row in enumerate(ranked.itertuples(), start=1):
+            pid = row.patient_id
+            if not keep(pid):
+                continue
+            shown += 1
+            with st.container(border=True):
+                head, prob = st.columns([2, 3])
+                head.markdown(f"**#{rank} · {pid}** · {row.unit} {row.room} · age {row.age}")
+                prob.progress(float(row.discharge_probability),
+                              text=f"Likely home today: **{row.discharge_probability:.0%}**")
+                st.caption(f"For: {row.reasons_for or '—'}  ·  Against: {row.reasons_against or '—'}")
+                if scan is not None and pid in scan["results"]:
+                    r = scan["results"][pid]
+                    if not r["barriers"]:
+                        st.caption(f"No barriers flagged · {r['source']}")
+                    for j, b in enumerate(r["barriers"]):
+                        badge = ":orange-badge[Social]" if b["type"] == "Social" else ":blue-badge[Medical]"
+                        item = f"{pid}: {b['barrier']}"
+                        done = bar_log[bar_log["item"] == item]
+                        flag_col, btn_col = st.columns([4, 2])
+                        flag_col.markdown(f"{badge} {b['barrier']} · suggested owner: **{b['owner']}**  \n"
+                                          f":gray[{r['source']}]")
+                        if len(done):
+                            e = done.iloc[-1]
+                            btn_col.caption(f"✅ Assigned to {b['owner']} by {e['role']} · {e['time'][11:16]}")
+                        else:
+                            btn_col.button(f"Assign to {b['owner']}", key=f"assign_{pid}_{j}", disabled=not can_assign,
+                                           on_click=assign_barrier, args=(role, pid, b, r["source"]), width="stretch")
+                with st.expander("Note"):
+                    st.write(row.nurse_note)
+        if scan is not None:
+            st.caption(f"Showing {shown} of {len(ranked)} patients.")
 
 
 # =====================================================================================
 # What-If: beds ready earlier
 # =====================================================================================
 with tab_whatif:
-    st.subheader("What if inpatient beds were ready earlier?")
-    st.caption(
-        "Earlier discharges and faster room cleaning mean admitted patients board in the ED for less time."
-    )
+    if silent:
+        st.info("Hidden in silent mode (Phase 1 pilot): predictions are logged for validation only.", icon="🔇")
+    else:
+        st.subheader("Medicine today: operational actions")
+        st.caption("Starts from the same Medicine forecast as the Control Center: day, flu/RSV trend, "
+                   "applied news alerts, and physician overrides.")
+        oc1, oc2 = st.columns([3, 2], gap="large")
+        lounge = oc1.checkbox("Open discharge lounge (beds free about 2 hours earlier)", key="wi_lounge")
+        clear_social = oc1.checkbox("Clear social barriers by 10 AM (from Barrier Flags)", key="wi_social")
+        flex = oc2.slider("Flex beds", 0, 6, 0, key="wi_flex")
+        scan_now = st.session_state.get("barrier_scan")
+        sc = fe.medicine_scenario(beds, ed_forecast, ranked, discharge_model, day_of_week, trend_level,
+                                  applied_alerts, lounge, clear_social, flex, scan_now)
+        base_f, scen_f = sc["base"], sc["scenario"]
 
-    def set_hours(h):
-        st.session_state["hours_earlier"] = h
+        def runout_text(f):
+            return fe.hour_label(f.runout_hour) if f.runout_hour else "No run-out"
 
-    st.session_state.setdefault("hours_earlier", 1.0)
-    preset_cols = st.columns(len(fe.WHAT_IF_PRESETS))
-    for i, (col, (label, h)) in enumerate(zip(preset_cols, fe.WHAT_IF_PRESETS.items())):
-        col.button(label, key=f"preset_{i}", on_click=set_hours, args=(h,), width="stretch",
-                   type="primary" if st.session_state["hours_earlier"] == h else "secondary")
-    hours_earlier = st.slider(
-        "Hours less boarding per admitted patient", 0.25, fe.MEDIAN_BOARDING_HOURS, step=0.25,
-        key="hours_earlier", format="%.2f h",
-        help=f"Capped at the {fe.MEDIAN_BOARDING_HOURS}-hour median boarding time.",
-    )
-    wi = fe.what_if_beds_earlier(hours_earlier, ed)
-    today, year = wi["today"], wi["per_year"]
-    h = year["hours_per_admission"]
-    adm = fe.ANNUAL_ADMISSIONS
-    rate = fe.BOARDING_COST_PER_HOUR
-    pprh = fe.PATIENTS_PER_ROOM_HOUR
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Run-out, base", runout_text(base_f))
+        m1.caption(f"Lowest point {base_f.min_open:+.1f} beds")
+        m2.metric("Run-out, with actions", runout_text(scen_f))
+        m2.caption(f"Lowest point {scen_f.min_open:+.1f} beds")
+        m3.metric("Boarding hours saved today", f"{sc['boarding_hours_saved']:.1f}")
+        m3.caption("Patient-hours without a Medicine bed, base minus scenario (9 AM–5 PM)")
+        m4.metric("Saved today", f"${sc['dollars_saved']:,.0f}")
+        m4.caption(f"{sc['boarding_hours_saved']:.1f} h × ${fe.BOARDING_COST_PER_HOUR}/h")
 
-    def stat(col, label, value, formula):
-        col.metric(label, value)
-        col.caption(formula)
+        both = pd.concat([
+            base_f.table.assign(series="Base"),
+            scen_f.table.assign(series="With actions"),
+        ])[["hour", "time", "series", "projected_open"]].round(1)
+        x_axis = alt.X("hour:O", title=None, sort=None, axis=alt.Axis(labelAngle=0, labelExpr=(
+            "datum.value < 12 ? datum.value + ' AM' : (datum.value == 12 ? '12 PM' : (datum.value - 12) + ' PM')")))
+        sc_color = alt.Color("series:N", title=None, legend=alt.Legend(orient="top"),
+                             scale=alt.Scale(domain=["Base", "With actions"], range=[SERIES_BLUE, SERIES_ORANGE]))
+        sc_base = alt.Chart(both).encode(x=x_axis, y=alt.Y("projected_open:Q", title="Projected open Medicine beds"),
+                                         color=sc_color)
+        sc_lines = sc_base.mark_line(strokeWidth=2).encode(strokeDash=alt.StrokeDash(
+            "series:N", legend=None, scale=alt.Scale(domain=["Base", "With actions"], range=[[1, 0], [6, 4]])))
+        sc_pts = sc_base.mark_point(filled=True, size=55).encode(
+            tooltip=[alt.Tooltip("time:N", title="Time"), alt.Tooltip("series:N", title="Forecast"),
+                     alt.Tooltip("projected_open:Q", title="Projected open beds", format=".1f")])
+        sc_zero = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color=CRITICAL_RED, strokeDash=[4, 3]).encode(y="y:Q")
+        st.altair_chart((sc_zero + sc_lines + sc_pts).properties(height=280), width="stretch")
+        notes = []
+        if lounge:
+            notes.append("discharge lounge pulls each discharge about 2 hours earlier")
+        if clear_social:
+            src = "the Barrier Flags scan" if scan_now else "documented social barriers (notes not scanned yet)"
+            notes.append(f"{sc['medicine_social_cleared']} Medicine patients' social barriers cleared, from {src} "
+                         f"(+{sc['extra_discharges_today']:.1f} expected discharges today)")
+        if flex:
+            notes.append(f"{flex} flex bed{'s' if flex != 1 else ''} open from 10 AM")
+        st.caption("Actions: " + ("; ".join(notes) if notes else "none selected") + ".")
+        st.divider()
 
-    with st.container(border=True):
-        st.markdown("**Value line 1 — Boarding cost avoided**")
-        c1, c2, c3 = st.columns(3)
-        stat(c1, "Boarding hours avoided per year", f"{year['boarding_hours_saved']:,.0f}",
-             f"{adm:,} admissions × {h:.2f} h")
-        stat(c2, "Cost avoided per year", f"${year['boarding_cost_avoided']:,.0f}",
-             f"{adm:,} admissions × {h:.2f} h × ${rate}/h")
-        stat(c3, "Cost avoided today", f"${today['boarding_cost_avoided']:,.0f}",
-             f"{today['boarders']} current boarders, up to {hours_earlier:.2f} h each "
-             f"= {today['boarding_hours_saved']:.1f} h × ${rate}/h")
+        st.subheader("Annual value: what if beds were ready earlier?")
         st.caption(
-            f"Per year: 85,000 ED visits × 16% admitted = {adm:,} admissions; hours saved per admission "
-            f"is capped at the {fe.MEDIAN_BOARDING_HOURS}-hour median boarding time."
+            "Earlier discharges and faster room cleaning mean admitted patients board in the ED for less time."
         )
 
-    with st.container(border=True):
-        st.markdown("**Value line 2 — Fewer patients leave without being seen (estimate)**")
-        c1, c2, c3, c4 = st.columns(4)
-        stat(c1, "ED room-hours freed per year", f"{year['room_hours_freed']:,.0f}",
-             f"{adm:,} admissions × {h:.2f} h (each boarder holds one room)")
-        stat(c2, "Patients roomed sooner per year", f"{year['patients_roomed_sooner']:,.0f}",
-             f"{year['room_hours_freed']:,.0f} room-hours × {pprh:.3f} patients/room-hour")
-        stat(c3, "Recovered visits per year (est.)", f"{year['recovered_visits']:,.0f}",
-             f"{year['patients_roomed_sooner']:,.0f} patients × {fe.LWBS_RATE:.0%} LWBS rate")
-        stat(c4, "Conservative estimate (freed ED rooms only)",
-             f"≈ ${round(year['recovered_revenue'], -4):,.0f}/yr",
-             f"{year['recovered_visits']:,.1f} visits × ${fe.NET_REVENUE_PER_VISIT:,}/visit "
-             f"= ${year['recovered_revenue']:,.0f}, rounded to the nearest $10K")
-        st.caption(
-            f"Today: {today['room_hours_freed']:.1f} room-hours × {pprh:.3f} × {fe.LWBS_RATE:.0%} = "
-            f"{today['recovered_visits']:.2f} recovered visits × ${fe.NET_REVENUE_PER_VISIT:,} = "
-            f"${today['recovered_revenue']:,.0f}."
+        def set_hours(h):
+            st.session_state["hours_earlier"] = h
+
+        st.session_state.setdefault("hours_earlier", 1.0)
+        preset_cols = st.columns(len(fe.WHAT_IF_PRESETS))
+        for i, (col, (label, h)) in enumerate(zip(preset_cols, fe.WHAT_IF_PRESETS.items())):
+            col.button(label, key=f"preset_{i}", on_click=set_hours, args=(h,), width="stretch",
+                       type="primary" if st.session_state["hours_earlier"] == h else "secondary")
+        hours_earlier = st.slider(
+            "Hours less boarding per admitted patient", 0.25, fe.MEDIAN_BOARDING_HOURS, step=0.25,
+            key="hours_earlier", format="%.2f h",
+            help=f"Capped at the {fe.MEDIAN_BOARDING_HOURS}-hour median boarding time.",
         )
-        st.warning(
-            "**This is an estimate, not a forecast.** Each ED room-hour freed from boarding serves about "
-            f"{pprh:.2f} more patients (233 arrivals/day ÷ 32 treatment rooms ÷ 24 h). Of those patients, the "
-            f"case's {fe.LWBS_RATE:.0%} left-without-being-seen rate is assumed to be recovered, at "
-            f"${fe.NET_REVENUE_PER_VISIT:,} average net revenue per ED visit.",
-            icon="📐",
-        )
-        up = fe.upper_lwbs_estimate()
-        st.markdown(
-            f"**Upper estimate:** If the Month-18 goal is met (LWBS {fe.LWBS_RATE:.1%} → {fe.LWBS_GOAL_RATE:.1%}): "
-            f"85,000 × {fe.LWBS_RATE - fe.LWBS_GOAL_RATE:.1%} = {up['visits']:,.0f} visits × "
-            f"${fe.NET_REVENUE_PER_VISIT:,} ≈ ${up['revenue'] / 1e6:.2f}M/yr"
-        )
+        wi = fe.what_if_beds_earlier(hours_earlier, ed)
+        today, year = wi["today"], wi["per_year"]
+        h = year["hours_per_admission"]
+        adm = fe.ANNUAL_ADMISSIONS
+        rate = fe.BOARDING_COST_PER_HOUR
+        pprh = fe.PATIENTS_PER_ROOM_HOUR
+
+        def stat(col, label, value, formula):
+            col.metric(label, value)
+            col.caption(formula)
+
+        with st.container(border=True):
+            st.markdown("**Value line 1 — Boarding cost avoided**")
+            c1, c2, c3 = st.columns(3)
+            stat(c1, "Boarding hours avoided per year", f"{year['boarding_hours_saved']:,.0f}",
+                 f"{adm:,} admissions × {h:.2f} h")
+            stat(c2, "Cost avoided per year", f"${year['boarding_cost_avoided']:,.0f}",
+                 f"{adm:,} admissions × {h:.2f} h × ${rate}/h")
+            stat(c3, "Cost avoided today", f"${today['boarding_cost_avoided']:,.0f}",
+                 f"{today['boarders']} current boarders, up to {hours_earlier:.2f} h each "
+                 f"= {today['boarding_hours_saved']:.1f} h × ${rate}/h")
+            st.caption(
+                f"Per year: 85,000 ED visits × 16% admitted = {adm:,} admissions; hours saved per admission "
+                f"is capped at the {fe.MEDIAN_BOARDING_HOURS}-hour median boarding time."
+            )
+
+        with st.container(border=True):
+            st.markdown("**Value line 2 — Fewer patients leave without being seen (estimate)**")
+            c1, c2, c3, c4 = st.columns([1, 1, 1, 1.5])
+            stat(c1, "ED room-hours freed per year", f"{year['room_hours_freed']:,.0f}",
+                 f"{adm:,} admissions × {h:.2f} h (each boarder holds one room)")
+            stat(c2, "Patients roomed sooner per year", f"{year['patients_roomed_sooner']:,.0f}",
+                 f"{year['room_hours_freed']:,.0f} room-hours × {pprh:.3f} patients/room-hour")
+            stat(c3, "Recovered visits per year (est.)", f"{year['recovered_visits']:,.0f}",
+                 f"{year['patients_roomed_sooner']:,.0f} patients × {fe.LWBS_RATE:.0%} LWBS rate")
+            stat(c4, "Conservative estimate (freed ED rooms only)",
+                 f"≈ ${round(year['recovered_revenue'], -4):,.0f}/yr",
+                 f"{year['recovered_visits']:,.1f} visits × ${fe.NET_REVENUE_PER_VISIT:,}/visit "
+                 f"= ${year['recovered_revenue']:,.0f}, rounded to the nearest $10K")
+            st.caption(
+                f"Today: {today['room_hours_freed']:.1f} room-hours × {pprh:.3f} × {fe.LWBS_RATE:.0%} = "
+                f"{today['recovered_visits']:.2f} recovered visits × ${fe.NET_REVENUE_PER_VISIT:,} = "
+                f"${today['recovered_revenue']:,.0f}."
+            )
+            st.warning(
+                "**This is an estimate, not a forecast.** Each ED room-hour freed from boarding serves about "
+                f"{pprh:.2f} more patients (233 arrivals/day ÷ 32 treatment rooms ÷ 24 h). Of those patients, the "
+                f"case's {fe.LWBS_RATE:.0%} left-without-being-seen rate is assumed to be recovered, at "
+                f"${fe.NET_REVENUE_PER_VISIT:,} average net revenue per ED visit.",
+                icon="📐",
+            )
+            up = fe.upper_lwbs_estimate()
+            st.markdown(
+                f"**Upper estimate:** If the Month-18 goal is met (LWBS {fe.LWBS_RATE:.1%} → {fe.LWBS_GOAL_RATE:.1%}): "
+                f"85,000 × {fe.LWBS_RATE - fe.LWBS_GOAL_RATE:.1%} = {up['visits']:,.0f} visits × "
+                f"${fe.NET_REVENUE_PER_VISIT:,} ≈ ${up['revenue'] / 1e6:.2f}M/yr"
+            )
 
 
 # =====================================================================================
@@ -738,7 +896,9 @@ with tab_equity:
     ref = base.set_index("group").loc["Commercial"]
     base["dtp_gap"] = base["door_to_provider_min"] - ref["door_to_provider_min"]
     base["lwbs_gap"] = (base["lwbs_pct"] - ref["lwbs_pct"]).round(1)
-    base.loc[base["group"].isin(["Commercial", "Overall"]), ["dtp_gap", "lwbs_gap"]] = None
+    is_ref = base["group"].isin(["Commercial", "Overall"])
+    base["dtp_gap"] = [("—" if r else f"{g:+.0f} min") for r, g in zip(is_ref, base["dtp_gap"])]
+    base["lwbs_gap"] = [("—" if r else f"{g:+.1f} pts") for r, g in zip(is_ref, base["lwbs_gap"])]
 
     overall = base.set_index("group").loc["Overall"]
     c1, c2 = st.columns(2)
@@ -751,9 +911,9 @@ with tab_equity:
         column_config={
             "group": "Payer",
             "door_to_provider_min": st.column_config.NumberColumn("Door-to-provider (min)", format="%d"),
-            "dtp_gap": st.column_config.NumberColumn("vs Commercial (min)", format="%+d"),
+            "dtp_gap": "Door-to-provider vs Commercial",
             "lwbs_pct": st.column_config.NumberColumn("Left without being seen (%)", format="%.1f"),
-            "lwbs_gap": st.column_config.NumberColumn("vs Commercial (pts)", format="%+.1f"),
+            "lwbs_gap": "LWBS vs Commercial",
         },
     )
     st.caption(
@@ -779,7 +939,7 @@ with tab_equity:
     gap_chart = gap.assign(label=gap["insurance"] + " (n=" + gap["patients"].astype(str) + ")",
                            over=gap["vs_overall_minutes"] > threshold)
     bars = alt.Chart(gap_chart).mark_bar(cornerRadiusEnd=4, size=22).encode(
-        y=alt.Y("label:N", title=None, sort=None),
+        y=alt.Y("label:N", title=None, sort=None, axis=alt.Axis(labelLimit=220)),
         x=alt.X("mean_minutes:Q", title="Mean boarding time (minutes)"),
         color=alt.condition("datum.over", alt.value(CRITICAL_RED), alt.value(SERIES_BLUE)),
         tooltip=[alt.Tooltip("insurance:N", title="Insurance"),
@@ -828,40 +988,43 @@ with tab_equity:
         "marked \"Too few to judge\" because their AUC is too noisy."
     )
 
-    # --- Override rate ------------------------------------------------------------------------
-    st.subheader("Override rate")
-    orate = fe.override_rate(decision_log)
-    low, high = fe.OVERRIDE_BAND
-    c1, c2 = st.columns([1, 2])
-    c1.metric("Override rate", f"{orate['rate']:.0%}", help="Share of ED bed-type decisions that overrode the AI.")
-    with c2:
-        msg = f"**{orate['status']}** · healthy band {low:.0%}–{high:.0%}"
-        (st.success if orate["status"] == "Healthy" else st.warning)(msg)
-        st.caption(f"Source: {orate['source']}. Too high means staff don't trust the tool; "
-                   "too low can mean rubber-stamping.")
+    if silent:
+        st.info("Override rate and Trust Score are hidden in silent mode: staff see no AI suggestions to override.", icon="🔇")
+    else:
+        # --- Override rate ------------------------------------------------------------------------
+        st.subheader("Override rate")
+        orate = fe.override_rate(decision_log)
+        low, high = fe.OVERRIDE_BAND
+        c1, c2 = st.columns([1, 2])
+        c1.metric("Override rate", f"{orate['rate']:.0%}", help="Share of ED bed-type decisions that overrode the AI.")
+        with c2:
+            msg = f"**{orate['status']}** · healthy band {low:.0%}–{high:.0%}"
+            (st.success if orate["status"] == "Healthy" else st.warning)(msg)
+            st.caption(f"Source: {orate['source']}. Too high means staff don't trust the tool; "
+                       "too low can mean rubber-stamping.")
 
-    # --- Trust Score -----------------------------------------------------------------------------
-    st.subheader("Trust Score: predicted vs. actual discharges (last 7 days)")
-    trust = fe.generate_discharge_trust()
-    avg_miss = trust["miss"].mean()
-    c1, c2 = st.columns(2)
-    c1.metric("Average miss", f"{avg_miss:.1f} discharges/day")
-    c2.metric("Average miss, % of actual", f"{(trust['miss'] / trust['actual']).mean():.1%}")
-    long = trust.melt(id_vars=["date", "miss"], value_vars=["predicted", "actual"],
-                      var_name="series", value_name="discharges")
-    long["series"] = long["series"].map({"predicted": "Predicted", "actual": "Actual"})
-    color = alt.Color("series:N", title=None, scale=alt.Scale(domain=["Predicted", "Actual"],
-                                                              range=[SERIES_BLUE, SERIES_ORANGE]),
-                      legend=alt.Legend(orient="top"))
-    base_t = alt.Chart(long).encode(x=alt.X("date:T", title=None, axis=alt.Axis(format="%a %b %d")),
-                                    y=alt.Y("discharges:Q", title="Discharges", scale=alt.Scale(zero=False)),
-                                    color=color)
-    lines = base_t.mark_line(strokeWidth=2)
-    pts = base_t.mark_point(filled=True, size=60).encode(
-        tooltip=[alt.Tooltip("date:T", format="%a %b %d"), "series:N",
-                 alt.Tooltip("discharges:Q", format=".0f"), alt.Tooltip("miss:Q", title="Miss", format=".1f")])
-    st.altair_chart((lines + pts).properties(height=260), width="stretch")
-    st.caption("Synthetic: hospital-wide discharges predicted by the likely-home-today model vs. what happened.")
+        # --- Trust Score -----------------------------------------------------------------------------
+        st.subheader("Trust Score: predicted vs. actual discharges (last 7 days)")
+        trust = fe.generate_discharge_trust()
+        avg_miss = trust["miss"].mean()
+        c1, c2 = st.columns(2)
+        c1.metric("Average miss", f"{avg_miss:.1f} discharges/day")
+        c2.metric("Average miss, % of actual", f"{(trust['miss'] / trust['actual']).mean():.1%}")
+        long = trust.melt(id_vars=["date", "miss"], value_vars=["predicted", "actual"],
+                          var_name="series", value_name="discharges")
+        long["series"] = long["series"].map({"predicted": "Predicted", "actual": "Actual"})
+        color = alt.Color("series:N", title=None, scale=alt.Scale(domain=["Predicted", "Actual"],
+                                                                  range=[SERIES_BLUE, SERIES_ORANGE]),
+                          legend=alt.Legend(orient="top"))
+        base_t = alt.Chart(long).encode(x=alt.X("date:T", title=None, axis=alt.Axis(format="%a %b %d")),
+                                        y=alt.Y("discharges:Q", title="Discharges", scale=alt.Scale(zero=False)),
+                                        color=color)
+        lines = base_t.mark_line(strokeWidth=2)
+        pts = base_t.mark_point(filled=True, size=60).encode(
+            tooltip=[alt.Tooltip("date:T", format="%a %b %d"), "series:N",
+                     alt.Tooltip("discharges:Q", format=".0f"), alt.Tooltip("miss:Q", title="Miss", format=".1f")])
+        st.altair_chart((lines + pts).properties(height=260), width="stretch")
+        st.caption("Synthetic: hospital-wide discharges predicted by the likely-home-today model vs. what happened.")
 
     # --- Pause / retire rules ------------------------------------------------------------------------
     with st.expander("Pause / retire rules"):
@@ -889,3 +1052,5 @@ with tab_equity:
         "Saved to data/decision_log.csv, so it survives a page refresh. "
         f"Only the {DECISION_OWNER.lower()} can clear it."
     )
+
+footer()

@@ -36,7 +36,14 @@ A staff-facing Streamlit dashboard for **emergency department (ED) patient flow 
 
 ### What-If tab
 
-Choose how many hours less each admitted patient boards in the ED. Earlier discharges and faster room cleaning are what make beds ready sooner. Two presets set the slider: **Month-18 goal: 1 hour less boarding (3.5 → 2.5 h)** and **Conservative: 45 minutes**. Every number shows its formula underneath.
+**Medicine today: operational actions.** Starts from the Control Center's Medicine forecast (same day, trend, applied alerts, and physician overrides). The actions are:
+- **Open discharge lounge:** beds free about 2 hours earlier.
+- **Clear social barriers by 10 AM:** uses the Barrier Flags scan, or documented barriers if notes haven't been scanned. Those patients are re-scored without the barrier.
+- **Flex beds:** 0–6, opening from 10 AM.
+
+It shows the base and scenario forecasts on one chart, the run-out time for each, boarding hours saved today (patient-hours without a Medicine bed), and dollars at $350/hour.
+
+**Annual value.** Choose how many hours less each admitted patient boards in the ED. Earlier discharges and faster room cleaning are what make beds ready sooner. Two presets set the slider: **Month-18 goal: 1 hour less boarding (3.5 → 2.5 h)** and **Conservative: 45 minutes**. Every number shows its formula underneath.
 
 **Per year (case brief figures, to match the slides):** 85,000 ED visits × 16% admitted = **13,600 admissions**. Hours saved per admission is the slider value, capped at the 3.5-hour median boarding time.
 
@@ -51,6 +58,22 @@ Choose how many hours less each admitted patient boards in the ED. Earlier disch
 **Upper estimate:** If the Month-18 goal is met (LWBS 4.0% → 2.8%): 85,000 × 1.2% = 1,020 visits × $1,500 ≈ $1.53M/yr.
 
 **Today** uses the 6 current boarders: each leaves up to the slider value sooner, never more than they actually boarded. Value line 2 is labelled in the app as an estimate, not a forecast.
+
+### Modes (sidebar)
+
+- **Silent mode (Phase 1 pilot):** hides every prediction, forecast, tier, and AI suggestion from staff, under the banner "Silent mode: predictions are logged for validation only and hidden from staff." Predictions are written to `data/silent_predictions.csv` (git-ignored) for later validation. Bed counts, ED rooms, boarding, the Halvian baseline, boarding by insurance, the bias test, and the decision log still show.
+- **Manual mode (whiteboard backup):** replaces the app with a printable whiteboard. It has colored bed squares per unit (green open, yellow cleaning, red occupied), the ED boarding list, and the manual protocol:
+  1. Declare downtime.
+  2. Use the whiteboard plus the last auto-printed board.
+  3. Hold bed huddles every 2 hours.
+  4. Request beds by phone.
+  5. Keep a paper log.
+  6. Reconcile after recovery.
+  7. Drill the protocol monthly.
+
+  Print it with Ctrl/Cmd + P; the sidebar is hidden when printing.
+
+Every page ends with: *AI recommendations only — a qualified human approves every action. Insurance, race, and language are never model inputs. All data is synthetic, calibrated to the Halvian case brief.*
 
 ### Sidebar
 
@@ -71,6 +94,63 @@ Header: **Insurance, race, and language are never model inputs; they are used on
   - *Retire* after 2 failed retraining cycles.
   - *Owners:* the CMIO (accountable), a data analyst (monthly monitoring), and the AI oversight committee (decides).
 - **Full decision log** with CSV download and Clear log (house supervisor only).
+
+## 90-second demo script
+
+Start with default inputs (**Monday 9 AM, elevated flu/RSV**). Clear the decision log first so the run starts clean.
+
+| Time | Do this | Say / show |
+|---|---|---|
+| 0:00 | **AI Control Center** | "It's Monday 9 AM in flu season. **Medicine runs out of beds by 12 PM**, short about 2 by 2 PM. That's a 3-hour head start." |
+| 0:10 | Point to the tier, then click **Approve** on "Open the discharge lounge" (acting as House supervisor) | "Level 1 — Tight. The house supervisor approves each action, and every decision is logged." |
+| 0:20 | News alerts → **Apply to forecast** on "Nearby hospital diverting ambulances" | "News never changes the forecast unless a person applies it. With diversion: short about 3, **escalates to Level 2 — Full**." |
+| 0:30 | **Barrier Flags** → **Scan notes with AI**. Switch "Acting as" to **Social worker**, then **Assign to Social work** on a "No ride home" flag | "Claude reads the notes (or the offline fallback does) and flags barriers. Social barriers go to the right team." |
+| 0:45 | **ED Admissions**, acting as **Physician** → **Override** ED-201 to **ICU** (reason: different level of care) | "The physician confirms level of care. The Control Center shows **Forecast updated by physician override**." |
+| 0:55 | **What-If** → tick **Clear social barriers by 10 AM** and **Open discharge lounge** | "**The shortage disappears.** Boarding hours and dollars saved today, plus $4.76M a year if boarding drops 1 hour per admission." |
+| 1:10 | **Equity & Oversight** | "**Medicaid/CHIP patients board 37 min longer**, and the alert fires. The Phase 1 bias test **catches age 65–79 before go-live**: do not go live, retrain and re-test." |
+| 1:20 | Sidebar → **Silent mode** | "Phase 1 pilot: predictions are logged for validation and hidden from staff." |
+| 1:25 | Sidebar → **Manual mode** | "If the system goes down: a printable whiteboard and a drilled manual protocol." |
+
+## Models
+
+Both models are **logistic regressions** (scikit-learn), chosen because they're explainable: every prediction can be broken down into how much each input moved it. Each is trained on 75% of its synthetic history and tested on the other 25%.
+
+| Model | Trained on | Inputs | Test AUC |
+|---|---|---|---|
+| Admission at triage | 6,000 past ED visits | age, triage acuity, heart rate, O₂ sat, temperature, blood pressure, chief complaint, cardiac history, prior ED visits | 0.84 |
+| Likely home today | 3,000 past inpatient days | days past expected stay, pending test, IV meds, mobility, physician noted likely discharge today, documented social barrier | 0.89 |
+
+**Reasons.** Each reason is an input's coefficient times its standardized value: how far it moves this patient's score compared with the average patient in the training data.
+
+**Likely bed type** uses fixed rules, not the model, checked in this order:
+1. **Women's & Peds** if age is under 18.
+2. **ICU** if triage acuity is 1, O₂ sat is below 89%, or systolic BP is below 90.
+3. **Telemetry** for chest pain, or cardiac history with heart rate above 105.
+4. **Surgery** for abdominal pain or fall/injury.
+5. Otherwise **Medicine**.
+
+## Bed forecast
+
+Projected open beds at each hour from 9 AM to 5 PM:
+
+> **open now + rooms cleaned + expected discharges − expected admissions**
+
+- **Rooms cleaned:** beds that need cleaning come back at one per hour.
+- **Expected discharges** come from the likely-home-today model. The unit's average probability is applied to every occupied bed, and discharges are weighted toward the afternoon, mostly after 2 PM.
+- **Expected admissions** are:
+  - boarders already admitted to the unit, placed one per hour as beds open;
+  - ED patients in workup whose likely bed is that unit, weighted by admit probability;
+  - new ED arrivals by hour × the 16% admit rate × the unit's share of ED admissions (Medicine 60%), adjusted by:
+    - **day of week:** Monday +15% (Sunday −8%), from the arrival pattern;
+    - **local flu/RSV trend:** Normal, Elevated +20%, or High +35%. This stands in for the brief's +20% winter respiratory season, so the season is not counted twice;
+    - **news alerts** a house supervisor has applied (for example, a nearby hospital diverting ambulances adds +15%).
+- **Physician overrides** in ED Admissions move that patient's expected admission to the corrected unit, or remove it for "Not admitting".
+
+A unit **runs out** when projected open beds drop below zero.
+
+The sidebar day-of-week and flu/RSV trend are set automatically from the synthetic "today" (Monday) and the simulated surveillance feed. Staff can override both.
+
+With the default inputs (Monday, elevated flu/RSV), **Medicine is projected to run out of beds by 12 PM and be about 2 beds short by 2 PM**. That gives staff a **3-hour head start** from the 9 AM forecast.
 
 ### Capacity tiers
 
@@ -112,6 +192,7 @@ All generators live in [`flow_engine.py`](flow_engine.py).
 | `generate_ed_arrivals()` | One year of hourly ED arrivals with day-of-week, time-of-day, and respiratory-season patterns. |
 | `generate_ed_visits()` | 6,000 past ED visits: age, triage acuity (1–5), heart rate, O₂ saturation, temperature, blood pressure, chief complaint, cardiac history, prior visits, insurance group, and an `admitted` outcome. |
 | `generate_current_ed_patients()` | 14 patients in the ED now: 6 admitted and boarding (3 of them waiting for Medicine, the tightest unit), 8 still in workup. |
+| `generate_discharge_trust()` | 7 days of predicted vs. actual hospital-wide discharges (Trust Score). |
 | `generate_inpatients()` | 40 inpatients with unit, room, age, insurance, length of stay, and a short nurse note. Notes may mention medical barriers (pending MRI, IV antibiotics, PT eval…) or social barriers (no ride home, can't afford meds, nursing-home placement, shelter, insurance authorization). |
 | `generate_past_inpatient_stays()` | 3,000 past inpatient days with days past expected stay, pending test, IV meds, mobility, physician discharge note, social barrier, and a `discharged_that_day` outcome. |
 | `generate_boarding_history()` | 30 days of ED boarding times by insurance group. |
@@ -142,6 +223,7 @@ Then open http://localhost:8501.
 ## Project layout
 
 ```
+.streamlit/       config.toml: hospital-blue theme
 app.py            Streamlit UI
 flow_engine.py    Synthetic data, models, bed-type rules, and bed forecast
 requirements.txt  streamlit, pandas, numpy, scikit-learn, anthropic
