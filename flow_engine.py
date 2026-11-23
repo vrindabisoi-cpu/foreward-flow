@@ -1092,6 +1092,90 @@ def tier_rationale(forecast: Forecast) -> str:
 
 
 # ---------------------------------------------------------------------------
+# ED rooms and staffing (case brief)
+# ---------------------------------------------------------------------------
+
+ED_ROOM_CAPACITY = {
+    "Treatment rooms": 32,
+    "Fast-track rooms": 8,
+    "Resuscitation/trauma bays": 4,
+    "Behavioral health rooms": 4,
+}
+WAITING_ROOM_SEATS = 40
+
+# Synthetic 9 AM snapshot: rooms in use by patients who are NOT boarders.
+# The 14 detailed ED patients are part of this census.
+_ED_ROOMS_IN_USE = {
+    "Treatment rooms": 23,
+    "Fast-track rooms": 6,
+    "Resuscitation/trauma bays": 2,
+    "Behavioral health rooms": 4,
+}
+WAITING_ROOM_PATIENTS = 17
+
+CURRENT_SHIFT_STAFFING = {
+    "shift": "Day shift 7a–3p",
+    "staff": {"Physicians": 4, "APPs": 3, "Nurses": 14, "Techs/registration": 8},
+}
+
+
+def ed_room_status(ed_scored: pd.DataFrame) -> pd.DataFrame:
+    """ED rooms by area. Boarders (admitted, waiting for a bed) hold treatment rooms."""
+    boarders = int((ed_scored["status"] == "Boarding").sum())
+    rows = []
+    for area, total in ED_ROOM_CAPACITY.items():
+        held = boarders if area == "Treatment rooms" else 0
+        in_use = _ED_ROOMS_IN_USE[area]
+        rows.append(
+            {"area": area, "total": total, "held_by_boarders": held,
+             "other_patients": in_use, "open": total - held - in_use}
+        )
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# What-if: beds ready earlier
+# ---------------------------------------------------------------------------
+
+LWBS_RATE = 0.04  # case brief: 4% of ED patients leave without being seen
+NET_REVENUE_PER_VISIT = 1_500  # case brief: average net revenue per ED visit
+# Patients one ED treatment room serves per hour on an average day.
+PATIENTS_PER_ROOM_HOUR = (ED_ARRIVALS_PER_YEAR / 365) / (ED_ROOM_CAPACITY["Treatment rooms"] * 24)
+
+
+def _value_lines(boarding_hours_saved: float) -> dict:
+    room_hours = boarding_hours_saved  # each boarder holds one ED treatment room
+    patients_roomed = room_hours * PATIENTS_PER_ROOM_HOUR
+    recovered = patients_roomed * LWBS_RATE
+    return {
+        "boarding_hours_saved": boarding_hours_saved,
+        "boarding_cost_avoided": boarding_hours_saved * BOARDING_COST_PER_HOUR,
+        "room_hours_freed": room_hours,
+        "patients_roomed_sooner": patients_roomed,
+        "recovered_visits": recovered,
+        "recovered_revenue": recovered * NET_REVENUE_PER_VISIT,
+    }
+
+
+def what_if_beds_earlier(hours_earlier: float, ed_scored: pd.DataFrame, boarding_history: pd.DataFrame) -> dict:
+    """Value of inpatient beds being ready `hours_earlier` hours sooner.
+
+    Each boarder leaves the ED up to `hours_earlier` hours sooner (never more
+    than they actually boarded). That gives two value lines:
+      1. Boarding cost avoided: hours saved x $350.
+      2. Fewer patients leave without being seen (ESTIMATE): freed ED room-hours
+         x patients per room-hour x 4% LWBS rate = recovered visits, x $1,500.
+    "Today" uses the current boarders; "per year" uses the 30-day boarding
+    history's average day x 365.
+    """
+    today = ed_scored.loc[ed_scored["status"] == "Boarding", "hours_boarding"]
+    today_saved = float(np.minimum(today, hours_earlier).sum())
+    hist_hours = boarding_history["boarding_minutes"] / 60
+    per_day = np.minimum(hist_hours, hours_earlier).groupby(boarding_history["date"]).sum().mean()
+    return {"today": _value_lines(today_saved), "per_year": _value_lines(float(per_day) * 365)}
+
+
+# ---------------------------------------------------------------------------
 # Decision log (saved to disk so it survives a page refresh)
 # ---------------------------------------------------------------------------
 

@@ -9,6 +9,7 @@ A staff-facing Streamlit dashboard for **emergency department (ED) patient flow 
 ### AI Control Center tab
 
 - **Live bed counts** per unit: 🟢 open, 🟡 needs cleaning, 🔴 occupied.
+- **ED room status:** 32 treatment rooms, 8 fast-track rooms, 4 resuscitation/trauma bays, 4 behavioral health rooms, and a 40-seat waiting room. Shows how many treatment rooms boarders are holding (e.g., "6 of 32 ED rooms held by boarders") and how many patients are waiting.
 - **ED boarding:** admitted patients boarding, total boarding hours, and today's boarding cost at $350 per boarding hour.
 - **8-hour bed forecast (9 AM–5 PM)** for a selected unit, with a red warning banner when the unit is projected to run out of beds. The banner lists the reasons and shows how many hours of head start staff have.
 - **Recommended capacity tier** with backup actions. The house supervisor approves or declines each action.
@@ -21,6 +22,19 @@ A staff-facing Streamlit dashboard for **emergency department (ED) patient flow 
 - **ED admission prediction.** For each patient in the ED: the probability of admission, the top 3 reasons pushing that score up, and a likely bed type.
 - **Likely to go home today.** Current inpatients ranked by their chance of discharge today, with the top reasons for it and the main barriers against it.
 - **Model performance** in the sidebar: both models' AUC, tested on held-out synthetic data.
+
+### What-If tab
+
+Move the slider to choose how many hours earlier inpatient beds are ready (from earlier discharges and faster cleaning). Each boarder then leaves the ED up to that many hours sooner, never more than they actually boarded.
+
+- **Value line 1 — Boarding cost avoided:** boarding hours avoided × $350.
+- **Value line 2 — Fewer patients leave without being seen (estimate).** Each freed ED room-hour serves about 0.30 more patients (233 arrivals/day ÷ 32 treatment rooms ÷ 24 h). The case's 4% left-without-being-seen rate is assumed to be recovered from those patients, at $1,500 average net revenue per ED visit.
+
+"Today" uses the current boarders. "Per year" uses an average day from the 30-day boarding history × 365. At 2 hours earlier, that's about $2.9M in boarding cost avoided and about 101 recovered visits (about $152K) per year. These are estimates, not forecasts.
+
+### Sidebar
+
+- **ED staffing for the current shift**, as context only: Day shift 7a–3p, 4 physicians, 3 APPs, 14 nurses, 8 techs/registration.
 
 ### Equity tab
 
