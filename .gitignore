@@ -3,6 +3,9 @@ __pycache__/
 *.pyc
 .DS_Store
 
+# Local decision log (may contain staff notes)
+data/decision_log.csv
+
 # Secrets: never commit
 .env
 .env.*

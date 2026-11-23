@@ -10,7 +10,10 @@ or changing one dataset never shifts the values of another.
 
 from __future__ import annotations
 
+import csv
+import os
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -23,7 +26,7 @@ from sklearn.preprocessing import StandardScaler
 SEED = 42
 REFERENCE_DATE = pd.Timestamp("2026-11-23")  # fixed "today" for reproducibility
 
-HOSPITAL_NAME = "ForeWard Flow Demo Hospital (fictional, 320 beds)"
+HOSPITAL_NAME = "ForeWard Flow — Halvian Medical Center (fictional, 320 beds)"
 
 UNIT_CAPACITY = {
     "Medicine": 120,
@@ -1026,11 +1029,11 @@ def forecast_unit(
 
 CAPACITY_TIERS = {
     "Normal": {
-        "when": "About 3 or more open beds all day",
+        "when": "Never runs out; about 3 or more open beds all day",
         "actions": ["Routine bed huddles"],
     },
     "Level 1 — Tight": {
-        "when": "Gets down to 0–2 open beds but does not run out",
+        "when": "Down to 0–2 open beds, or runs out 3+ hours away and short 2 beds or fewer",
         "actions": [
             "Work the \"likely home today\" list first",
             "Open the discharge lounge",
@@ -1039,7 +1042,7 @@ CAPACITY_TIERS = {
         ],
     },
     "Level 2 — Full": {
-        "when": "Runs out of beds, short up to about 2",
+        "when": "Runs out within 2 hours, or short more than 2 beds",
         "actions": [
             "Open flex beds with extra nurse shifts",
             "Hallway-bed protocol for stable patients (RN approval)",
@@ -1048,7 +1051,7 @@ CAPACITY_TIERS = {
         ],
     },
     "Level 3 — Crisis": {
-        "when": "Short about 3 or more beds",
+        "when": "Short 3+ beds within 2 hours, or short 4+ beds at any time",
         "actions": [
             "Delay non-urgent planned surgeries (CMO approval)",
             "Transfer stable patients to partner facilities",
@@ -1059,15 +1062,65 @@ CAPACITY_TIERS = {
 
 
 def recommend_tier(forecast: Forecast) -> str:
-    """Uses the same cut-off as the run-out warning: below 0 means out of beds."""
-    low = forecast.min_open
-    if low >= 2.5:
-        return "Normal"
-    if low >= 0:
-        return "Level 1 — Tight"
-    if low > -2.5:
+    """Tier from how soon the unit runs out (below 0 beds) and by how much.
+
+    - Never runs out: Normal if ~3+ beds all day, otherwise Tight.
+    - Runs out 3+ hours away and short 2 beds or fewer: Tight (time to act).
+    - Runs out within 2 hours, or short more than 2 beds: Full.
+    - Short 3+ beds within 2 hours, or short 4+ beds at any time: Crisis.
+    """
+    if forecast.runout_hour is None:
+        return "Normal" if forecast.min_open >= 2.5 else "Level 1 — Tight"
+    short = round(-forecast.min_open)
+    hours_away = forecast.head_start_hours
+    if short >= 4 or (short >= 3 and hours_away <= 2):
+        return "Level 3 — Crisis"
+    if hours_away <= 2 or short > 2:
         return "Level 2 — Full"
-    return "Level 3 — Crisis"
+    return "Level 1 — Tight"
+
+
+def tier_rationale(forecast: Forecast) -> str:
+    if forecast.runout_hour is None:
+        return f"Does not run out; lowest point is about {max(forecast.min_open, 0):.1f} open beds."
+    short = round(-forecast.min_open)
+    hours = forecast.head_start_hours
+    return (
+        f"Runs out {hours} hour{'s' if hours != 1 else ''} from now "
+        f"({hour_label(forecast.runout_hour)}), short about {short} bed{'s' if short != 1 else ''} at most."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Decision log (saved to disk so it survives a page refresh)
+# ---------------------------------------------------------------------------
+
+DECISION_LOG_COLUMNS = ["time", "role", "decision", "item", "context", "reason"]
+DECISION_LOG_PATH = Path(
+    os.environ.get("FOREWARD_DECISION_LOG", Path(__file__).resolve().parent / "data" / "decision_log.csv")
+)
+
+
+def read_decision_log(path: Path | None = None) -> pd.DataFrame:
+    path = Path(path or DECISION_LOG_PATH)
+    if not path.exists():
+        return pd.DataFrame(columns=DECISION_LOG_COLUMNS)
+    return pd.read_csv(path, dtype=str, keep_default_na=False)
+
+
+def append_decision(entry: dict, path: Path | None = None) -> None:
+    path = Path(path or DECISION_LOG_PATH)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    new_file = not path.exists()
+    with path.open("a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=DECISION_LOG_COLUMNS)
+        if new_file:
+            writer.writeheader()
+        writer.writerow({c: entry.get(c, "") for c in DECISION_LOG_COLUMNS})
+
+
+def clear_decision_log(path: Path | None = None) -> None:
+    Path(path or DECISION_LOG_PATH).unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------

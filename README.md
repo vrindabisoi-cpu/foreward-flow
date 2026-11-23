@@ -1,6 +1,6 @@
-# ForeWard Flow
+# ForeWard Flow — Halvian Medical Center (fictional, 320 beds)
 
-A staff-facing Streamlit dashboard for **emergency department (ED) patient flow and boarding** at a fictional 320-bed hospital, built for a hospital case competition.
+A staff-facing Streamlit dashboard for **emergency department (ED) patient flow and boarding** at Halvian Medical Center, a fictional 320-bed hospital, built for a hospital case competition.
 
 > **All data is synthetic, calibrated to the Halvian case brief.** No real patients, staff, or hospital records are used. Every dataset is generated in code from a fixed random seed (`42`), so the numbers are the same on every run. The only non-synthetic numbers are the case brief's equity baseline, shown in the Equity tab.
 
@@ -69,14 +69,14 @@ With the default inputs (Monday, elevated flu/RSV), **Medicine is projected to r
 
 ### Capacity tiers
 
-The tier is picked from the lowest projected open-bed count, using the same cut-off as the run-out warning.
+The tier depends on how soon the unit runs out and by how many beds. With the default inputs, Medicine runs out in 3 hours and is short about 2 beds, so the recommendation is **Level 1 — Tight**: there's still time to free beds before escalating. Monday with a High flu/RSV trend plus the applied ambulance-diversion alert reaches **Level 3 — Crisis**.
 
 | Tier | When | Backup actions |
 |---|---|---|
-| Normal | About 3 or more open beds all day | Routine huddles |
-| Level 1 — Tight | Gets down to 0–2 open beds but does not run out | Work the likely-home-today list first; open discharge lounge; prioritize cleaning; extra bed huddle |
-| Level 2 — Full | Runs out, short up to about 2 beds | Flex beds with extra nurse shifts; hallway-bed protocol for stable patients (RN approval); inpatient teams round on ED boarders; fast-track |
-| Level 3 — Crisis | Short about 3 or more beds | Delay non-urgent planned surgeries (CMO approval); transfer stable patients; ambulance diversion as a last resort |
+| Normal | Never runs out; about 3 or more open beds all day | Routine huddles |
+| Level 1 — Tight | Down to 0–2 open beds, or runs out 3+ hours away and short 2 beds or fewer | Work the likely-home-today list first; open discharge lounge; prioritize cleaning; extra bed huddle |
+| Level 2 — Full | Runs out within 2 hours, or short more than 2 beds | Flex beds with extra nurse shifts; hallway-bed protocol for stable patients (RN approval); inpatient teams round on ED boarders; fast-track |
+| Level 3 — Crisis | Short 3+ beds within 2 hours, or short 4+ beds at any time | Delay non-urgent planned surgeries (CMO approval); transfer stable patients; ambulance diversion as a last resort |
 
 ### Human in the loop
 
@@ -84,7 +84,7 @@ The tier is picked from the lowest projected open-bed count, using the same cut-
 - A reason is required to decline an action or dismiss an alert.
 - **Public health data** (simulated CDC/state surveillance) adjusts the forecast automatically.
 - **News alerts** (simulated) never change the forecast unless a house supervisor applies them.
-- Every decision is logged with time, role, and reason. The log lasts for the browser session.
+- Every decision is logged with time, role, and reason to `data/decision_log.csv`, so it survives a page refresh. The file is git-ignored. Only the house supervisor can clear it, and clearing leaves one entry recording who cleared it.
 
 ## Synthetic datasets
 

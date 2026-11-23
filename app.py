@@ -11,7 +11,7 @@ import streamlit as st
 
 import flow_engine as fe
 
-st.set_page_config(page_title="ForeWard Flow", layout="wide")
+st.set_page_config(page_title="ForeWard Flow — Halvian Medical Center", layout="wide")
 
 DECISION_OWNER = "House supervisor"
 ROLES = [DECISION_OWNER, "Charge nurse", "Bed manager", "ED physician"]
@@ -41,9 +41,7 @@ beds = data["beds"]
 feed = fe.public_health_feed()
 alerts = fe.news_alerts()
 
-# --- Session state: decision log and news-alert review status ------------------
-st.session_state.setdefault("decision_log", [])
-st.session_state.setdefault("alert_status", {a["id"]: "Pending review" for a in alerts})
+# --- Decision log (saved to data/decision_log.csv) ----------------------------------
 
 
 def log_decision(role, decision, item, context, reason_key, default_reason, require_reason):
@@ -52,7 +50,7 @@ def log_decision(role, decision, item, context, reason_key, default_reason, requ
         verb = {"Declined": "decline", "Dismissed": "dismiss"}.get(decision, decision.lower())
         st.session_state["flash"] = f"Add a reason before you {verb}."
         return False
-    st.session_state["decision_log"].append(
+    fe.append_decision(
         {
             "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "role": role,
@@ -66,6 +64,29 @@ def log_decision(role, decision, item, context, reason_key, default_reason, requ
     return True
 
 
+def clear_log(role):
+    fe.clear_decision_log()
+    # Keep a record that the log was cleared, and by whom.
+    fe.append_decision(
+        {
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "role": role,
+            "decision": "Cleared log",
+            "item": "Decision log",
+            "context": "Decision log",
+            "reason": "Log cleared by house supervisor",
+        }
+    )
+
+
+def alert_status(log, alert):
+    rows = log[log["item"] == f"News alert: {alert['headline']}"]
+    return rows["decision"].iloc[-1] if len(rows) else "Pending review"
+
+
+decision_log = fe.read_decision_log()
+
+
 def decide_action(role, decision, action, context):
     log_decision(
         role, decision, action, context, "action_reason",
@@ -75,14 +96,10 @@ def decide_action(role, decision, action, context):
 
 def review_alert(role, alert, decision):
     key = f"alert_reason_{alert['id']}"
-    ok = log_decision(
+    log_decision(
         role, decision, f"News alert: {alert['headline']}", "Public health & news alerts", key,
         "Applied after review", require_reason=(decision == "Dismissed"),
     )
-    if ok:
-        st.session_state["alert_status"][alert["id"]] = (
-            "Applied to forecast" if decision == "Applied to forecast" else "Dismissed"
-        )
 
 
 # --- Sidebar ---------------------------------------------------------------------
@@ -124,8 +141,8 @@ with st.sidebar:
         "they're kept only for fairness checks."
     )
 
-st.title("ForeWard Flow")
-st.caption(f"{fe.HOSPITAL_NAME} · Synthetic data only — not real patients")
+st.title(fe.HOSPITAL_NAME)
+st.caption("Synthetic data only — not real patients")
 
 if "flash" in st.session_state:
     st.error(st.session_state.pop("flash"))
@@ -161,7 +178,7 @@ with tab_control:
     st.subheader("8-hour bed forecast (9 AM–5 PM)")
     units = list(fe.UNIT_CAPACITY)
     unit = st.selectbox("Unit", units, index=units.index("Medicine"))
-    applied = [a for a in alerts if st.session_state["alert_status"][a["id"]] == "Applied to forecast"]
+    applied = [a for a in alerts if alert_status(decision_log, a) == "Applied to forecast"]
     forecast = fe.forecast_unit(unit, beds, ed, ranked, day_of_week, trend_level, applied)
     tier = fe.recommend_tier(forecast)
 
@@ -254,14 +271,13 @@ with tab_control:
     tier_info = fe.CAPACITY_TIERS[tier]
     icon = {"Normal": "✅", "Level 1 — Tight": "🟡", "Level 2 — Full": "🟠", "Level 3 — Crisis": "🔴"}[tier]
     st.markdown(f"### {icon} {unit}: {tier}")
-    st.caption(f"Why this tier: {tier_info['when'].lower()} (lowest projected: {forecast.min_open:.1f}).")
+    st.caption(f"Why this tier: {fe.tier_rationale(forecast)}")
     st.markdown(f"**Decision owner: {DECISION_OWNER}**")
 
     context = f"{unit} · {tier} · {day_of_week} · {trend_level}"
     latest = {}
-    for entry in st.session_state["decision_log"]:
-        if entry["context"] == context:
-            latest[entry["item"]] = entry
+    for entry in decision_log[decision_log["context"] == context].to_dict("records"):
+        latest[entry["item"]] = entry
 
     st.text_input(
         "Reason for your decision (required to decline)",
@@ -320,7 +336,7 @@ with tab_control:
         st.markdown("**News alerts — for house supervisor review**")
         st.caption("Simulated news. Alerts never change the forecast unless a person applies them.")
         for alert in alerts:
-            status = st.session_state["alert_status"][alert["id"]]
+            status = alert_status(decision_log, alert)
             effect = ", ".join(f"{u} +{p:.0%}" for u, p in alert["effect"].items())
             if len(alert["effect"]) == len(fe.UNIT_CAPACITY):
                 effect = f"all units +{next(iter(alert['effect'].values())):.0%}"
@@ -350,10 +366,7 @@ with tab_control:
 
     # --- Decision log ------------------------------------------------------------------------
     st.subheader("Decision log")
-    log = pd.DataFrame(
-        st.session_state["decision_log"],
-        columns=["time", "role", "decision", "item", "context", "reason"],
-    )
+    log = decision_log
     if log.empty:
         st.caption("No decisions yet.")
     else:
@@ -363,10 +376,18 @@ with tab_control:
             width="stretch",
             column_config={c: c.capitalize() for c in log.columns},
         )
-        st.download_button(
+        d_col, c_col, _ = st.columns([1, 1, 3])
+        d_col.download_button(
             "Download log (CSV)", log.to_csv(index=False), "foreward_flow_decision_log.csv", "text/csv"
         )
-    st.caption("The log is kept for this browser session (demo).")
+        with c_col.popover("Clear log", disabled=not is_owner):
+            st.markdown(f"Delete all {len(log)} entries? A single entry recording the clear is kept.")
+            st.button("Yes, clear the log", key="confirm_clear_log", type="primary",
+                      on_click=clear_log, args=(role,))
+    st.caption(
+        "Saved to data/decision_log.csv, so it survives a page refresh. "
+        f"Only the {DECISION_OWNER.lower()} can clear it."
+    )
 
 # =====================================================================================
 # Patient flow: ED predictions and discharge list
