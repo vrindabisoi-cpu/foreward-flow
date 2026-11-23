@@ -6,6 +6,17 @@ A staff-facing Streamlit dashboard for **emergency department (ED) patient flow 
 
 ## What it shows
 
+### AI Control Center tab
+
+- **Live bed counts** per unit: 🟢 open, 🟡 needs cleaning, 🔴 occupied.
+- **ED boarding:** admitted patients boarding, total boarding hours, and today's boarding cost at $350 per boarding hour.
+- **8-hour bed forecast (9 AM–5 PM)** for a selected unit, with a red warning banner when the unit is projected to run out of beds. The banner lists the reasons and shows how many hours of head start staff have.
+- **Recommended capacity tier** with backup actions. The house supervisor approves or declines each action.
+- **Public health & news alerts** (simulated).
+- **Decision log** of every decision, with time, role, and reason. It can be downloaded as a CSV.
+
+### Patient flow tab
+
 - **Bed status** for five inpatient units: open, needs cleaning, and occupied beds, plus occupancy %.
 - **ED admission prediction.** For each patient in the ED: the probability of admission, the top 3 reasons pushing that score up, and a likely bed type.
 - **Likely to go home today.** Current inpatients ranked by their chance of discharge today, with the top reasons for it and the main barriers against it.
@@ -28,6 +39,45 @@ Both models are **logistic regressions** (scikit-learn), chosen because they're 
 3. **Telemetry** for chest pain, or cardiac history with heart rate above 105.
 4. **Surgery** for abdominal pain or fall/injury.
 5. Otherwise **Medicine**.
+
+## Bed forecast
+
+Projected open beds at each hour from 9 AM to 5 PM:
+
+> **open now + rooms cleaned + expected discharges − expected admissions**
+
+- **Rooms cleaned:** beds that need cleaning come back at one per hour.
+- **Expected discharges** come from the likely-home-today model. The unit's average probability is applied to every occupied bed, and discharges are weighted toward the afternoon, mostly after 2 PM.
+- **Expected admissions** are:
+  - boarders already admitted to the unit;
+  - ED patients in workup whose likely bed is that unit, weighted by admit probability;
+  - new ED arrivals by hour, adjusted by:
+    - **day of week:** Monday +15%;
+    - **local flu/RSV trend:** Normal, Elevated +20%, or High +35%;
+    - **news alerts** a house supervisor has applied.
+
+The sidebar day-of-week and flu/RSV trend are set automatically from the synthetic "today" (Monday) and the simulated surveillance feed. Staff can override both.
+
+With the default inputs (Monday, elevated flu/RSV), **Medicine is projected to run out of beds by 12 PM and be about 2 beds short by 2 PM**. That gives staff a **3-hour head start** from the 9 AM forecast.
+
+### Capacity tiers
+
+The tier is picked from the lowest projected open-bed count.
+
+| Tier | When | Backup actions |
+|---|---|---|
+| Normal | 3 or more open beds all day | Routine huddles |
+| Level 1 — Tight | Lowest point is 1–2 open beds | Work the likely-home-today list first; open discharge lounge; prioritize cleaning; extra bed huddle |
+| Level 2 — Full | Runs out, short up to 3 beds | Flex beds with extra nurse shifts; hallway-bed protocol for stable patients (RN approval); inpatient teams round on ED boarders; fast-track |
+| Level 3 — Crisis | Short 4 or more beds | Delay non-urgent planned surgeries (CMO approval); transfer stable patients; ambulance diversion as a last resort |
+
+### Human in the loop
+
+- **Decision owner: House supervisor.** Only the house supervisor role can approve or decline actions, or apply or dismiss news alerts. Other roles see the page as view-only.
+- A reason is required to decline an action or dismiss an alert.
+- **Public health data** (simulated CDC/state surveillance) adjusts the forecast automatically.
+- **News alerts** (simulated) never change the forecast unless a house supervisor applies them.
+- Every decision is logged with time, role, and reason. The log lasts for the browser session.
 
 ## Synthetic datasets
 
@@ -71,6 +121,6 @@ Then open http://localhost:8501.
 
 ```
 app.py            Streamlit UI
-flow_engine.py    Synthetic data, models, and bed-type rules
+flow_engine.py    Synthetic data, models, bed-type rules, and bed forecast
 requirements.txt  streamlit, pandas, numpy, scikit-learn
 ```

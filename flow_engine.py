@@ -692,6 +692,298 @@ def rank_inpatients(model: ExplainableLogit, inpatients: pd.DataFrame) -> pd.Dat
 
 
 # ---------------------------------------------------------------------------
+# AI Control Center: boarding cost, 8-hour bed forecast, capacity tiers
+# ---------------------------------------------------------------------------
+
+BOARDING_COST_PER_HOUR = 350  # dollars per boarding hour
+
+FORECAST_START_HOUR = 9  # 9 AM
+FORECAST_HOURS = 8  # through 5 PM
+
+DAYS_OF_WEEK = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+DAY_ADJUSTMENT = {"Monday": 0.15}  # Monday: +15% admissions; other days +0%
+
+TREND_LEVELS = {"Normal": 0.0, "Elevated flu/RSV": 0.20, "High": 0.35}
+
+# New ED arrivals expected to need each unit, per hour, on a typical day.
+NEW_ADMITS_PER_HOUR = {
+    "Medicine": 1.5,
+    "Surgery": 0.9,
+    "Telemetry": 0.55,
+    "ICU": 0.3,
+    "Women's & Peds": 0.6,
+}
+# Relative ED admission volume for each hour slot 9-10 AM ... 4-5 PM.
+ARRIVAL_PROFILE = [0.70, 0.85, 1.10, 1.20, 1.20, 1.10, 1.00, 0.90]
+# Share of the DAY's expected discharges that happen in each slot.
+# Most discharges land in the afternoon; the rest go after 5 PM.
+DISCHARGE_PROFILE = [0.01, 0.02, 0.04, 0.04, 0.06, 0.12, 0.16, 0.15]
+CLEANING_PER_HOUR = 1.0  # needs-cleaning rooms turned over per hour per unit
+AFTERNOON_START_HOUR = 14  # "after 2 PM"
+
+
+def hour_label(hour: int) -> str:
+    suffix = "AM" if hour < 12 else "PM"
+    return f"{(hour - 1) % 12 + 1} {suffix}"
+
+
+def default_day_of_week() -> str:
+    return REFERENCE_DATE.day_name()
+
+
+def public_health_feed() -> dict:
+    """SIMULATED public health surveillance (styled after CDC/state reports).
+
+    Not real data. The local level adjusts the forecast automatically.
+    """
+    return {
+        "source": "Simulated CDC/state surveillance data (synthetic, not real)",
+        "as_of": (REFERENCE_DATE - pd.Timedelta(days=2)).strftime("%b %d, %Y"),
+        "local": {
+            "level": "Elevated flu/RSV",
+            "trend": "Rising 3 weeks in a row",
+            "flu_ed_visits_pct": 4.8,
+            "rsv_ed_visits_pct": 2.1,
+        },
+        "national": {
+            "level": "Moderate",
+            "trend": "Rising",
+            "flu_ed_visits_pct": 3.2,
+            "rsv_ed_visits_pct": 1.4,
+        },
+    }
+
+
+def news_alerts() -> list[dict]:
+    """SIMULATED news alerts. They never change the forecast on their own;
+    a house supervisor must choose "Apply to forecast".
+    """
+    return [
+        {
+            "id": "measles-county",
+            "headline": "Measles outbreak reported in county",
+            "source": "Simulated local news feed",
+            "detail": "County health department reports 6 confirmed cases, mostly children.",
+            "effect": {"Women's & Peds": 0.10, "Medicine": 0.03},
+        },
+        {
+            "id": "nearby-diversion",
+            "headline": "Nearby hospital diverting ambulances",
+            "source": "Simulated regional EMS feed",
+            "detail": "A nearby hospital is on ambulance diversion until about 3 PM.",
+            "effect": {unit: 0.10 for unit in UNIT_CAPACITY},
+        },
+        {
+            "id": "ice-storm",
+            "headline": "Ice storm expected tonight",
+            "source": "Simulated weather service feed",
+            "detail": "Freezing rain expected after 6 PM; more falls and crashes likely overnight.",
+            "effect": {"Surgery": 0.08},
+        },
+    ]
+
+
+def boarding_metrics(ed_scored: pd.DataFrame) -> dict:
+    boarders = ed_scored[ed_scored["status"] == "Boarding"]
+    hours = float(boarders["hours_boarding"].sum())
+    return {
+        "patients": len(boarders),
+        "total_hours": hours,
+        "cost": hours * BOARDING_COST_PER_HOUR,
+    }
+
+
+def expected_discharges_today(unit: str, beds: pd.DataFrame, inpatients_ranked: pd.DataFrame) -> float:
+    """The charted inpatients are a sample, so the unit's average model
+    probability is applied to every occupied bed on the unit."""
+    occupied = int(beds.set_index("unit").at[unit, "occupied"])
+    probs = inpatients_ranked.loc[inpatients_ranked["unit"] == unit, "discharge_probability"]
+    mean_p = float(probs.mean()) if len(probs) else 0.0
+    return mean_p * occupied
+
+
+@dataclass
+class Forecast:
+    unit: str
+    table: pd.DataFrame  # one row per hour, 9 AM to 5 PM
+    admission_adjustment: float  # e.g. 0.38 for +38%
+    day_of_week: str
+    trend_level: str
+    applied_alerts: list
+    ed_boarders: int
+    ed_workup: int
+    discharges_today: float
+
+    @property
+    def min_open(self) -> float:
+        return float(self.table["projected_open"].min())
+
+    @property
+    def runout_hour(self):
+        """First hour the unit has no open bed left, or None."""
+        hit = self.table[self.table["projected_open"] < 0.5]
+        return int(hit["hour"].iloc[0]) if len(hit) else None
+
+    @property
+    def worst_hour(self) -> int:
+        return int(self.table.loc[self.table["projected_open"].idxmin(), "hour"])
+
+    @property
+    def head_start_hours(self):
+        return None if self.runout_hour is None else self.runout_hour - FORECAST_START_HOUR
+
+    @property
+    def afternoon_discharge_share(self) -> float:
+        slots = range(FORECAST_HOURS)
+        after = sum(DISCHARGE_PROFILE[i] for i in slots if FORECAST_START_HOUR + i >= AFTERNOON_START_HOUR)
+        return after / sum(DISCHARGE_PROFILE)
+
+    def warning(self):
+        if self.runout_hour is None:
+            return None
+        text = f"{self.unit} projected to run out of beds by {hour_label(self.runout_hour)}"
+        short = round(-self.min_open)
+        if short >= 1:
+            text += f" — short about {short} bed{'s' if short != 1 else ''} by {hour_label(self.worst_hour)}"
+        return text
+
+    def reasons(self) -> list[str]:
+        out = []
+        day = DAY_ADJUSTMENT.get(self.day_of_week, 0)
+        if day:
+            out.append(f"{self.day_of_week}: +{day:.0%} expected admissions")
+        trend = TREND_LEVELS[self.trend_level]
+        if trend:
+            out.append(f"Flu/RSV trend {self.trend_level.split(' ')[0]}: +{trend:.0%} expected admissions (simulated surveillance data)")
+        for a in self.applied_alerts:
+            out.append(f"Applied news alert: {a['headline']} (+{a['effect'].get(self.unit, 0):.0%})")
+        n_ed = self.ed_boarders + self.ed_workup
+        if n_ed:
+            out.append(
+                f"{n_ed} ED patient{'s' if n_ed != 1 else ''} likely needing {self.unit} "
+                f"({self.ed_boarders} already admitted and boarding, {self.ed_workup} in workup)"
+            )
+        out.append(
+            f"Discharges usually come after 2 PM ({self.afternoon_discharge_share:.0%} of those "
+            f"expected by 5 PM happen after 2 PM)"
+        )
+        return out
+
+
+def forecast_unit(
+    unit: str,
+    beds: pd.DataFrame,
+    ed_scored: pd.DataFrame,
+    inpatients_ranked: pd.DataFrame,
+    day_of_week: str,
+    trend_level: str,
+    applied_alerts: list | None = None,
+) -> Forecast:
+    """Projected open beds by hour:
+    open now + rooms cleaned + expected discharges - expected admissions.
+
+    Expected admissions = ED patients (boarders, plus workup patients weighted
+    by admit probability) + new ED arrivals by hour, scaled by day of week,
+    public health trend, and any news alerts a human applied.
+    """
+    applied_alerts = applied_alerts or []
+    b = beds.set_index("unit").loc[unit]
+
+    adjustment = (
+        DAY_ADJUSTMENT.get(day_of_week, 0)
+        + TREND_LEVELS[trend_level]
+        + sum(a["effect"].get(unit, 0) for a in applied_alerts)
+    )
+    multiplier = 1 + adjustment
+
+    boarders = ed_scored[(ed_scored["status"] == "Boarding") & (ed_scored["admit_unit"] == unit)]
+    workup = ed_scored[(ed_scored["status"] == "In workup") & (ed_scored["likely_bed"] == unit)]
+    workup_expected = float(workup["admit_probability"].sum())
+    dc_today = expected_discharges_today(unit, beds, inpatients_ranked)
+
+    rows = [{"hour": FORECAST_START_HOUR, "cleaned": 0.0, "discharges": 0.0,
+             "ed_admits": 0.0, "new_arrival_admits": 0.0}]
+    for i in range(FORECAST_HOURS):
+        prev = rows[-1]
+        ed_now = len(boarders) if i == 0 else 0  # boarders take the first beds
+        if i in (1, 2):
+            ed_now += workup_expected / 2  # workup decisions over the next 2-3 hours
+        rows.append(
+            {
+                "hour": FORECAST_START_HOUR + i + 1,
+                "cleaned": min(float(b["needs_cleaning"]), (i + 1) * CLEANING_PER_HOUR),
+                "discharges": prev["discharges"] + dc_today * DISCHARGE_PROFILE[i],
+                "ed_admits": prev["ed_admits"] + ed_now,
+                "new_arrival_admits": prev["new_arrival_admits"]
+                + NEW_ADMITS_PER_HOUR[unit] * ARRIVAL_PROFILE[i] * multiplier,
+            }
+        )
+    table = pd.DataFrame(rows)
+    table.insert(0, "time", table["hour"].map(hour_label))
+    table.insert(2, "open_now", int(b["open"]))
+    table["projected_open"] = (
+        table["open_now"] + table["cleaned"] + table["discharges"]
+        - table["ed_admits"] - table["new_arrival_admits"]
+    )
+    return Forecast(
+        unit=unit,
+        table=table,
+        admission_adjustment=adjustment,
+        day_of_week=day_of_week,
+        trend_level=trend_level,
+        applied_alerts=applied_alerts,
+        ed_boarders=len(boarders),
+        ed_workup=len(workup),
+        discharges_today=dc_today,
+    )
+
+
+CAPACITY_TIERS = {
+    "Normal": {
+        "when": "At least 3 open beds all day",
+        "actions": ["Routine bed huddles"],
+    },
+    "Level 1 — Tight": {
+        "when": "Lowest point is 1–2 open beds",
+        "actions": [
+            "Work the \"likely home today\" list first",
+            "Open the discharge lounge",
+            "Prioritize cleaning of discharged rooms",
+            "Add an extra bed huddle",
+        ],
+    },
+    "Level 2 — Full": {
+        "when": "Runs out of beds, short up to 3",
+        "actions": [
+            "Open flex beds with extra nurse shifts",
+            "Hallway-bed protocol for stable patients (RN approval)",
+            "Inpatient teams round on ED boarders",
+            "Use fast-track for low-acuity ED patients",
+        ],
+    },
+    "Level 3 — Crisis": {
+        "when": "Short 4 or more beds",
+        "actions": [
+            "Delay non-urgent planned surgeries (CMO approval)",
+            "Transfer stable patients to partner facilities",
+            "Coordinate ambulance diversion (last resort)",
+        ],
+    },
+}
+
+
+def recommend_tier(forecast: Forecast) -> str:
+    low = round(forecast.min_open)
+    if low >= 3:
+        return "Normal"
+    if low >= 1:
+        return "Level 1 — Tight"
+    if low >= -3:
+        return "Level 2 — Full"
+    return "Level 3 — Crisis"
+
+
+# ---------------------------------------------------------------------------
 # Convenience
 # ---------------------------------------------------------------------------
 
