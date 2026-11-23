@@ -30,6 +30,7 @@ OVERRIDE_REASONS = [
 SOCIAL_ORANGE = "#e07b39"
 SERIES_BLUE = "#2a78d6"
 CRITICAL_RED = "#d03b3b"
+SERIES_ORANGE = "#eb6834"
 
 
 @st.cache_data
@@ -140,6 +141,8 @@ def run_scan():
 
 
 decision_log = fe.read_decision_log()
+# Forecast uses the ED list with physician overrides applied (display tables keep the AI view).
+ed_forecast, physician_overrides = fe.apply_physician_overrides(ed, decision_log)
 
 
 def decide_action(role, decision, action, context):
@@ -224,7 +227,7 @@ if "flash" in st.session_state:
     st.error(st.session_state.pop("flash"))
 
 tab_control, tab_ed, tab_barriers, tab_whatif, tab_equity = st.tabs(
-    ["AI Control Center", "ED Admissions", "Barrier Flags", "What-If", "Equity"]
+    ["AI Control Center", "ED Admissions", "Barrier Flags", "What-If", "Equity & Oversight"]
 )
 
 # =====================================================================================
@@ -275,7 +278,7 @@ with tab_control:
     units = list(fe.UNIT_CAPACITY)
     unit = st.selectbox("Unit", units, index=units.index("Medicine"))
     applied = [a for a in alerts if alert_status(decision_log, a) == "Applied to forecast"]
-    forecast = fe.forecast_unit(unit, beds, ed, ranked, day_of_week, trend_level, applied)
+    forecast = fe.forecast_unit(unit, beds, ed_forecast, ranked, day_of_week, trend_level, applied)
     tier = fe.recommend_tier(forecast)
 
     warning = forecast.warning()
@@ -299,6 +302,13 @@ with tab_control:
             st.markdown(f"### ⏱️ {hs}-hour head start" if hs else "### ⏱️ No head start")
             st.caption(f"From the 9 AM forecast to the projected {fe.hour_label(forecast.runout_hour)} run-out.")
         st.metric("Expected admissions adjustment", f"+{forecast.admission_adjustment:.0%}")
+    unit_overrides = [o for o in physician_overrides if unit in (o["from"], o["to"])]
+    if unit_overrides:
+        st.info(
+            "**Forecast updated by physician override.** "
+            + "; ".join(f"{o['patient_id']}: {o['from']} → {o['to']}" for o in unit_overrides),
+            icon="🩺",
+        )
 
     chart_df = forecast.table.assign(projected_open=lambda d: d["projected_open"].round(1))
     x = alt.X("hour:O", title=None, sort=None, axis=alt.Axis(labelExpr=
@@ -350,7 +360,7 @@ with tab_control:
     with st.expander("All units at a glance"):
         overview = []
         for u in units:
-            f = fe.forecast_unit(u, beds, ed, ranked, day_of_week, trend_level, applied)
+            f = fe.forecast_unit(u, beds, ed_forecast, ranked, day_of_week, trend_level, applied)
             overview.append(
                 {
                     "Unit": u,
@@ -460,30 +470,14 @@ with tab_control:
             else:
                 st.info(body, icon="✅" if status == "Applied to forecast" else "🗑️")
 
-    # --- Decision log ------------------------------------------------------------------------
-    st.subheader("Decision log")
-    log = decision_log
-    if log.empty:
+    # --- Recent decisions ----------------------------------------------------------------------
+    st.subheader("Recent decisions")
+    if decision_log.empty:
         st.caption("No decisions yet.")
     else:
-        st.dataframe(
-            log.iloc[::-1],
-            hide_index=True,
-            width="stretch",
-            column_config={c: c.capitalize() for c in log.columns},
-        )
-        d_col, c_col, _ = st.columns([1, 1, 3])
-        d_col.download_button(
-            "Download log (CSV)", log.to_csv(index=False), "foreward_flow_decision_log.csv", "text/csv"
-        )
-        with c_col.popover("Clear log", disabled=not is_owner):
-            st.markdown(f"Delete all {len(log)} entries? A single entry recording the clear is kept.")
-            st.button("Yes, clear the log", key="confirm_clear_log", type="primary",
-                      on_click=clear_log, args=(role,))
-    st.caption(
-        "Saved to data/decision_log.csv, so it survives a page refresh. "
-        f"Only the {DECISION_OWNER.lower()} can clear it."
-    )
+        st.dataframe(decision_log.iloc[::-1].head(5), hide_index=True, width="stretch",
+                     column_config={c: c.capitalize() for c in decision_log.columns})
+    st.caption("The full log, CSV download, and Clear log are in the Equity & Oversight tab.")
 
 # =====================================================================================
 # ED Admissions: AI admit prediction + bed type, confirmed by people
@@ -606,8 +600,23 @@ with tab_barriers:
                    "frees beds sooner and helps the groups that board longest.")
 
     bar_log = decision_log[decision_log["context"] == "Barrier Flags"]
+    show = st.radio("Show:", ["All", "Only patients with barriers", "Social only"], index=1,
+                    horizontal=True, key="barrier_filter")
+    if scan is None and show != "All":
+        st.caption("Showing all patients until notes are scanned.")
+
+    def keep(pid):
+        if scan is None or show == "All":
+            return True
+        kinds = {b["type"] for b in scan["results"].get(pid, {}).get("barriers", [])}
+        return bool(kinds) if show == "Only patients with barriers" else "Social" in kinds
+
+    shown = 0
     for rank, row in enumerate(ranked.itertuples(), start=1):
         pid = row.patient_id
+        if not keep(pid):
+            continue
+        shown += 1
         with st.container(border=True):
             head, prob = st.columns([2, 3])
             head.markdown(f"**#{rank} · {pid}** · {row.unit} {row.room} · age {row.age}")
@@ -633,6 +642,8 @@ with tab_barriers:
                                        on_click=assign_barrier, args=(role, pid, b, r["source"]), width="stretch")
             with st.expander("Note"):
                 st.write(row.nurse_note)
+    if scan is not None:
+        st.caption(f"Showing {shown} of {len(ranked)} patients.")
 
 
 # =====================================================================================
@@ -720,6 +731,7 @@ with tab_whatif:
 # Equity
 # =====================================================================================
 with tab_equity:
+    st.markdown("**Insurance, race, and language are never model inputs; they are used only to check fairness.**")
     st.subheader("Halvian baseline")
     st.caption("From the Halvian case brief (not synthetic): ED performance by payer before ForeWard Flow.")
     base = fe.HALVIAN_BASELINE.copy()
@@ -749,22 +761,131 @@ with tab_equity:
         "and leave without being seen almost twice as often (5.8% vs 3.0%)."
     )
 
-    st.subheader("Boarding time by payer (synthetic, last 30 days)")
+    # --- Boarding time by insurance --------------------------------------------------------
+    st.subheader("Boarding time by insurance group (synthetic, last 30 days)")
     gap = fe.boarding_gap_by_insurance(data["boarding"])
+    overall_mean = data["boarding"]["boarding_minutes"].mean()
+    threshold = st.slider("Equity alert threshold: minutes above the overall average", 5, 60, 20, 5)
+    over = gap[gap["vs_overall_minutes"] > threshold]
+    if len(over):
+        st.error(
+            "**Equity alert:** " + "; ".join(
+                f"{r.insurance} patients board {r.vs_overall_minutes:.0f} min longer than average"
+                for r in over.itertuples()
+            ) + f" (threshold: {threshold} min).", icon="⚖️",
+        )
+    else:
+        st.success(f"No insurance group boards more than {threshold} min above the average.", icon="⚖️")
+    gap_chart = gap.assign(label=gap["insurance"] + " (n=" + gap["patients"].astype(str) + ")",
+                           over=gap["vs_overall_minutes"] > threshold)
+    bars = alt.Chart(gap_chart).mark_bar(cornerRadiusEnd=4, size=22).encode(
+        y=alt.Y("label:N", title=None, sort=None),
+        x=alt.X("mean_minutes:Q", title="Mean boarding time (minutes)"),
+        color=alt.condition("datum.over", alt.value(CRITICAL_RED), alt.value(SERIES_BLUE)),
+        tooltip=[alt.Tooltip("insurance:N", title="Insurance"),
+                 alt.Tooltip("patients:Q", title="Boarded patients"),
+                 alt.Tooltip("mean_minutes:Q", title="Mean (min)", format=".0f"),
+                 alt.Tooltip("median_minutes:Q", title="Median (min)", format=".0f"),
+                 alt.Tooltip("vs_overall_minutes:Q", title="vs average (min)", format="+.0f")],
+    )
+    labels = bars.mark_text(align="left", dx=4, color="gray").encode(
+        text=alt.Text("mean_minutes:Q", format=".0f"), color=alt.value("gray"))
+    avg = alt.Chart(pd.DataFrame({"x": [overall_mean], "t": [f"Average {overall_mean:.0f} min"]}))
+    avg_rule = avg.mark_rule(strokeDash=[4, 3], color="gray").encode(x="x:Q")
+    avg_text = avg.mark_text(align="left", dx=4, dy=-8, color="gray", fontSize=11).encode(
+        x="x:Q", y=alt.value(0), text="t:N")
+    st.altair_chart((bars + labels + avg_rule + avg_text).properties(height=34 * len(gap_chart) + 40),
+                    width="stretch")
+    st.caption(f"Red bars exceed the average by more than {threshold} min. Overall median boarding: "
+               f"{data['boarding']['boarding_minutes'].median() / 60:.1f} hours.")
+
+    # --- Phase 1 bias test ----------------------------------------------------------------------
+    st.subheader("Phase 1 bias test: admission model")
+    fair = fe.fairness_auc(admission_model, data["ed_visits"])
+    overall_auc = fair.attrs["overall_auc"]
+    flagged = fair[fair["status"].str.startswith("Do not go live")]
+    if len(flagged):
+        st.error(
+            "**Do not go live: retrain and re-test.** "
+            + "; ".join(f"{r.attribute} {r.group}: AUC {r.auc:.2f} ({r.gap:+.2f})" for r in flagged.itertuples())
+            + f" — more than {fe.FAIRNESS_AUC_GAP} below overall ({overall_auc:.2f}).", icon="🛑",
+        )
+    else:
+        st.success(f"Every group is within {fe.FAIRNESS_AUC_GAP} of overall AUC ({overall_auc:.2f}).", icon="✅")
     st.dataframe(
-        gap,
-        hide_index=True,
-        width="stretch",
+        fair, hide_index=True, width="stretch",
         column_config={
-            "insurance": "Payer",
-            "patients": "Boarded patients",
-            "mean_minutes": st.column_config.NumberColumn("Mean (min)", format="%.0f"),
-            "median_minutes": st.column_config.NumberColumn("Median (min)", format="%.0f"),
-            "vs_overall_minutes": st.column_config.NumberColumn("vs overall mean (min)", format="%+.0f"),
+            "attribute": "Checked by", "group": "Group", "patients": "Test patients",
+            "admitted": "Admitted",
+            "auc": st.column_config.NumberColumn("AUC", format="%.3f"),
+            "gap": st.column_config.NumberColumn("vs overall", format="%+.3f"),
+            "status": "Result",
         },
     )
-    medicaid_gap = gap.set_index("insurance").at[fe.MEDICAID, "vs_overall_minutes"]
     st.caption(
-        f"Overall median boarding time: {data['boarding']['boarding_minutes'].median() / 60:.1f} hours. "
-        f"Medicaid/CHIP patients board about {medicaid_gap:.0f} minutes longer than average."
+        f"Held-out test set: {admission_model.n_test:,} synthetic ED visits, overall AUC {overall_auc:.3f}. "
+        f"Groups with fewer than {fe.FAIRNESS_MIN_GROUP} patients or {fe.FAIRNESS_MIN_ADMITTED} admissions are "
+        "marked \"Too few to judge\" because their AUC is too noisy."
+    )
+
+    # --- Override rate ------------------------------------------------------------------------
+    st.subheader("Override rate")
+    orate = fe.override_rate(decision_log)
+    low, high = fe.OVERRIDE_BAND
+    c1, c2 = st.columns([1, 2])
+    c1.metric("Override rate", f"{orate['rate']:.0%}", help="Share of ED bed-type decisions that overrode the AI.")
+    with c2:
+        msg = f"**{orate['status']}** · healthy band {low:.0%}–{high:.0%}"
+        (st.success if orate["status"] == "Healthy" else st.warning)(msg)
+        st.caption(f"Source: {orate['source']}. Too high means staff don't trust the tool; "
+                   "too low can mean rubber-stamping.")
+
+    # --- Trust Score -----------------------------------------------------------------------------
+    st.subheader("Trust Score: predicted vs. actual discharges (last 7 days)")
+    trust = fe.generate_discharge_trust()
+    avg_miss = trust["miss"].mean()
+    c1, c2 = st.columns(2)
+    c1.metric("Average miss", f"{avg_miss:.1f} discharges/day")
+    c2.metric("Average miss, % of actual", f"{(trust['miss'] / trust['actual']).mean():.1%}")
+    long = trust.melt(id_vars=["date", "miss"], value_vars=["predicted", "actual"],
+                      var_name="series", value_name="discharges")
+    long["series"] = long["series"].map({"predicted": "Predicted", "actual": "Actual"})
+    color = alt.Color("series:N", title=None, scale=alt.Scale(domain=["Predicted", "Actual"],
+                                                              range=[SERIES_BLUE, SERIES_ORANGE]),
+                      legend=alt.Legend(orient="top"))
+    base_t = alt.Chart(long).encode(x=alt.X("date:T", title=None, axis=alt.Axis(format="%a %b %d")),
+                                    y=alt.Y("discharges:Q", title="Discharges", scale=alt.Scale(zero=False)),
+                                    color=color)
+    lines = base_t.mark_line(strokeWidth=2)
+    pts = base_t.mark_point(filled=True, size=60).encode(
+        tooltip=[alt.Tooltip("date:T", format="%a %b %d"), "series:N",
+                 alt.Tooltip("discharges:Q", format=".0f"), alt.Tooltip("miss:Q", title="Miss", format=".1f")])
+    st.altair_chart((lines + pts).properties(height=260), width="stretch")
+    st.caption("Synthetic: hospital-wide discharges predicted by the likely-home-today model vs. what happened.")
+
+    # --- Pause / retire rules ------------------------------------------------------------------------
+    with st.expander("Pause / retire rules"):
+        for heading, items in fe.PAUSE_RETIRE_RULES.items():
+            st.markdown(f"**{heading}**\n" + "\n".join(f"- {i}" for i in items))
+        st.markdown("**Owners**\n" + "\n".join(f"- **{who}:** {what}" for who, what in fe.OVERSIGHT_OWNERS.items()))
+
+    # --- Full decision log -------------------------------------------------------------------------------
+    st.subheader("Decision log")
+    log = decision_log
+    if log.empty:
+        st.caption("No decisions yet.")
+    else:
+        st.dataframe(log.iloc[::-1], hide_index=True, width="stretch",
+                     column_config={c: c.capitalize() for c in log.columns})
+        d_col, c_col, _ = st.columns([1, 1, 3])
+        d_col.download_button(
+            "Download log (CSV)", log.to_csv(index=False), "foreward_flow_decision_log.csv", "text/csv"
+        )
+        with c_col.popover("Clear log", disabled=not is_owner):
+            st.markdown(f"Delete all {len(log)} entries? A single entry recording the clear is kept.")
+            st.button("Yes, clear the log", key="confirm_clear_log", type="primary",
+                      on_click=clear_log, args=(role,))
+    st.caption(
+        "Saved to data/decision_log.csv, so it survives a page refresh. "
+        f"Only the {DECISION_OWNER.lower()} can clear it."
     )

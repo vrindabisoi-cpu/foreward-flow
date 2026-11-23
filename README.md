@@ -14,7 +14,8 @@ A staff-facing Streamlit dashboard for **emergency department (ED) patient flow 
 - **8-hour bed forecast (9 AM–5 PM)** for a selected unit, with a red warning banner when the unit is projected to run out of beds. The banner lists the reasons and shows how many hours of head start staff have.
 - **Recommended capacity tier** with backup actions. The house supervisor approves or declines each action.
 - **Public health & news alerts** (simulated).
-- **Decision log** of every decision, with time, role, and reason. It can be downloaded as a CSV.
+- **Physician overrides update the forecast.** When a physician overrides a patient's bed type (or marks them "Not admitting") in ED Admissions, that unit's expected admissions change. The banner and tier update, and a note says "Forecast updated by physician override." Bed manager overrides (room assignment) are logged but don't change the forecast. A later Accept restores the AI bed type.
+- **Recent decisions:** the last 5 entries. The full log is in Equity & Oversight.
 
 ### ED Admissions tab
 
@@ -29,6 +30,7 @@ A staff-facing Streamlit dashboard for **emergency department (ED) patient flow 
 - **Scan notes with AI** sends each note to the Claude API (official `anthropic` Python SDK, `POST /v1/messages`, structured JSON output). Claude returns each barrier tagged **Medical** or **Social** with a suggested owner team (Social work, Case management, Pharmacy, Hospitalist). It is told not to make clinical decisions, and only the note text is sent, never insurance or demographics.
 - **API key:** entered in the sidebar password box or set as `ANTHROPIC_API_KEY`. It is never hard-coded, saved, or logged. The model name is editable in the sidebar; the default is `claude-opus-5-5`. Server-side refusal fallback is on for models that support it.
 - **Offline fallback:** with no key, or for any note whose call fails, keyword rules flag the barriers instead. The page always says which source was used ("Claude API" or "Offline fallback") and why.
+- **Show:** All / Only patients with barriers (default) / Social only.
 - Totals at the top, orange **Social** and blue **Medical** flags per patient, the note in an expander, and an **Assign to [owner team]** button. Only the **Case manager** or **Social worker** role can assign; each assignment is logged with the barrier text.
 - A bar chart shows the % of scanned patients with a social barrier by insurance group. Help is routed by documented need, never by insurance type.
 
@@ -54,50 +56,21 @@ Choose how many hours less each admitted patient boards in the ED. Earlier disch
 
 - **ED staffing for the current shift**, as context only: Day shift 7a–3p, 4 physicians, 3 APPs, 14 nurses, 8 techs/registration.
 
-### Equity tab
+### Equity & Oversight tab
 
-- **Halvian baseline** from the case brief: door-to-provider time and left-without-being-seen (LWBS) rate by payer, with gaps against Commercial.
-- **Boarding time by payer** from the synthetic 30-day boarding history.
+Header: **Insurance, race, and language are never model inputs; they are used only to check fairness.**
 
-## Models
-
-Both models are **logistic regressions** (scikit-learn), chosen because they're explainable: every prediction can be broken down into how much each input moved it. Each is trained on 75% of its synthetic history and tested on the other 25%.
-
-| Model | Trained on | Inputs | Test AUC |
-|---|---|---|---|
-| Admission at triage | 6,000 past ED visits | age, triage acuity, heart rate, O₂ sat, temperature, blood pressure, chief complaint, cardiac history, prior ED visits | 0.84 |
-| Likely home today | 3,000 past inpatient days | days past expected stay, pending test, IV meds, mobility, physician noted likely discharge today, documented social barrier | 0.89 |
-
-**Reasons.** Each reason is an input's coefficient times its standardized value: how far it moves this patient's score compared with the average patient in the training data.
-
-**Likely bed type** uses fixed rules, not the model, checked in this order:
-1. **Women's & Peds** if age is under 18.
-2. **ICU** if triage acuity is 1, O₂ sat is below 89%, or systolic BP is below 90.
-3. **Telemetry** for chest pain, or cardiac history with heart rate above 105.
-4. **Surgery** for abdominal pain or fall/injury.
-5. Otherwise **Medicine**.
-
-## Bed forecast
-
-Projected open beds at each hour from 9 AM to 5 PM:
-
-> **open now + rooms cleaned + expected discharges − expected admissions**
-
-- **Rooms cleaned:** beds that need cleaning come back at one per hour.
-- **Expected discharges** come from the likely-home-today model. The unit's average probability is applied to every occupied bed, and discharges are weighted toward the afternoon, mostly after 2 PM.
-- **Expected admissions** are:
-  - boarders already admitted to the unit, placed one per hour as beds open;
-  - ED patients in workup whose likely bed is that unit, weighted by admit probability;
-  - new ED arrivals by hour × the 16% admit rate × the unit's share of ED admissions (Medicine 60%), adjusted by:
-    - **day of week:** Monday +15% (Sunday −8%), from the arrival pattern;
-    - **local flu/RSV trend:** Normal, Elevated +20%, or High +35%. This stands in for the brief's +20% winter respiratory season, so the season is not counted twice;
-    - **news alerts** a house supervisor has applied.
-
-A unit **runs out** when projected open beds drop below zero.
-
-The sidebar day-of-week and flu/RSV trend are set automatically from the synthetic "today" (Monday) and the simulated surveillance feed. Staff can override both.
-
-With the default inputs (Monday, elevated flu/RSV), **Medicine is projected to run out of beds by 12 PM and be about 2 beds short by 2 PM**. That gives staff a **3-hour head start** from the 9 AM forecast.
+- **Halvian baseline** from the case brief: door-to-provider time and LWBS rate by payer.
+- **Boarding time by insurance group** (synthetic, last 30 days) as a bar chart. An **equity alert** fires if any group boards more than a set number of minutes above average (slider, default 20). By default Medicaid/CHIP, at +37 min, triggers it.
+- **Phase 1 bias test:** admission model AUC on the held-out test set by insurance, race/ethnicity, age group, and language. Any group more than 0.05 below overall is flagged **"Do not go live: retrain and re-test."** Groups with fewer than 30 test patients or 10 admissions are marked "Too few to judge." Currently age group 65–79 (AUC 0.79 vs. 0.84 overall) is flagged.
+- **Override rate** from the decision log, with a healthy band of 5–40%. Too high means staff don't trust the tool; too low can mean rubber-stamping. With fewer than 5 logged decisions, it shows a labeled synthetic 30-day baseline of 18%.
+- **Trust Score:** predicted vs. actual discharges for the last 7 days (synthetic), with the average miss (3.0 discharges/day, 5.1%).
+- **Pause / retire rules:**
+  - *Pause* if any group's AUC falls more than 0.05 below overall, calibration drifts, or a safety event is linked to the tool.
+  - *Review* if the override rate is outside 5–40% for 2 weeks.
+  - *Retire* after 2 failed retraining cycles.
+  - *Owners:* the CMIO (accountable), a data analyst (monthly monitoring), and the AI oversight committee (decides).
+- **Full decision log** with CSV download and Clear log (house supervisor only).
 
 ### Capacity tiers
 

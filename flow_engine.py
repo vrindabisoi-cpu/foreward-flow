@@ -634,6 +634,7 @@ class ExplainableLogit:
         self.pipeline.fit(X_train, y_train)
         self.auc = float(roc_auc_score(y_test, self.pipeline.predict_proba(X_test)[:, 1]))
         self.n_train, self.n_test = len(X_train), len(X_test)
+        self.test_index = X_test.index  # held-out rows, kept for fairness checks
         return self
 
     def predict_proba(self, df: pd.DataFrame) -> np.ndarray:
@@ -1421,6 +1422,127 @@ def append_decision(entry: dict, path: Path | None = None) -> None:
 
 def clear_decision_log(path: Path | None = None) -> None:
     Path(path or DECISION_LOG_PATH).unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# Physician overrides -> forecast
+# ---------------------------------------------------------------------------
+
+NOT_ADMITTING = "Not admitting"
+
+
+def apply_physician_overrides(ed_scored: pd.DataFrame, log: pd.DataFrame):
+    """Copy of the ED patients with each patient's latest physician override applied,
+    for the forecast only. A later Accept restores the AI bed type.
+
+    Returns (adjusted copy, list of applied overrides as dicts).
+    """
+    out = ed_scored.copy()
+    applied = []
+    ed_log = log[(log["context"] == "ED Admissions") & log["decision"].isin(["Accepted", "Overridden"])]
+    for pid in out["patient_id"]:
+        rows = ed_log[ed_log["item"].str.startswith(f"{pid} bed type:")]
+        if not len(rows):
+            continue
+        last = rows.iloc[-1]
+        if last["decision"] != "Overridden" or last["role"] != "Physician" or " → " not in last["item"]:
+            continue
+        old, new = last["item"].split(": ", 1)[1].split(" → ")
+        idx = out.index[out["patient_id"] == pid][0]
+        if out.at[idx, "status"] == "Boarding":
+            out.at[idx, "admit_unit"] = None if new == NOT_ADMITTING else new
+        out.at[idx, "likely_bed"] = new
+        if new == NOT_ADMITTING:
+            out.at[idx, "admit_probability"] = 0.0
+        applied.append({"patient_id": pid, "from": old, "to": new, "time": last["time"]})
+    return out, applied
+
+
+# ---------------------------------------------------------------------------
+# Equity & oversight
+# ---------------------------------------------------------------------------
+
+FAIRNESS_AUC_GAP = 0.05  # flag any group this far below overall AUC
+FAIRNESS_MIN_GROUP = 30  # smaller groups are shown but marked "too few to judge"
+FAIRNESS_MIN_ADMITTED = 10  # AUC with fewer admitted patients is too noisy to judge
+OVERRIDE_BAND = (0.05, 0.40)
+OVERRIDE_MIN_DECISIONS = 5
+SYNTHETIC_OVERRIDE_BASELINE = 0.18  # synthetic 30-day baseline, shown when the log is thin
+
+
+def fairness_auc(model: "ExplainableLogit", ed_visits: pd.DataFrame) -> pd.DataFrame:
+    """Admission model AUC on the held-out test set, by insurance, race/ethnicity,
+    age group, and language. These fields are NOT model inputs."""
+    test = ed_visits.loc[model.test_index]
+    p = model.predict_proba(test)
+    y = test["admitted"].to_numpy()
+    overall = roc_auc_score(y, p)
+    rows = []
+    for attr, label in [("insurance", "Insurance"), ("race_ethnicity", "Race/ethnicity"),
+                        ("age_group", "Age group"), ("primary_language", "Language")]:
+        for group, idx in test.groupby(attr).indices.items():
+            yg, pg = y[idx], p[idx]
+            enough = (len(idx) >= FAIRNESS_MIN_GROUP and yg.sum() >= FAIRNESS_MIN_ADMITTED
+                      and yg.sum() < len(yg))
+            auc = roc_auc_score(yg, pg) if 0 < yg.sum() < len(yg) else np.nan
+            gap = auc - overall if not np.isnan(auc) else np.nan
+            if not enough:
+                status = "Too few to judge"
+            elif gap < -FAIRNESS_AUC_GAP:
+                status = "Do not go live: retrain and re-test"
+            else:
+                status = "OK"
+            rows.append({"attribute": label, "group": group, "patients": len(idx),
+                         "admitted": int(yg.sum()), "auc": auc, "gap": gap, "status": status})
+    out = pd.DataFrame(rows)
+    out.attrs["overall_auc"] = overall
+    return out
+
+
+def override_rate(log: pd.DataFrame) -> dict:
+    """Share of ED bed-type decisions that overrode the AI, from the decision log.
+    With fewer than 5 decisions, falls back to a labeled synthetic baseline."""
+    d = log[(log["context"] == "ED Admissions") & log["decision"].isin(["Accepted", "Overridden"])]
+    n = len(d)
+    if n >= OVERRIDE_MIN_DECISIONS:
+        rate, source = (d["decision"] == "Overridden").mean(), f"Decision log ({n} decisions)"
+    else:
+        rate, source = SYNTHETIC_OVERRIDE_BASELINE, (
+            f"Synthetic 30-day baseline (only {n} logged decision{'s' if n != 1 else ''} so far)")
+    low, high = OVERRIDE_BAND
+    if rate > high:
+        status = "Too high: staff may not trust the tool"
+    elif rate < low:
+        status = "Too low: possible rubber-stamping"
+    else:
+        status = "Healthy"
+    return {"rate": float(rate), "source": source, "status": status, "decisions": n}
+
+
+def generate_discharge_trust(days: int = 7) -> pd.DataFrame:
+    """Synthetic predicted vs. actual hospital-wide discharges for the last `days` days."""
+    rng = _rng(9)
+    dates = pd.date_range(end=REFERENCE_DATE - pd.Timedelta(days=1), periods=days)
+    predicted = np.round(rng.normal(64, 5, days) * np.where(dates.dayofweek >= 5, 0.8, 1.0), 1)
+    actual = np.round(predicted + rng.normal(0, 3.5, days)).astype(int)
+    return pd.DataFrame({"date": dates, "predicted": predicted, "actual": actual,
+                         "miss": np.abs(actual - predicted).round(1)})
+
+
+PAUSE_RETIRE_RULES = {
+    "Pause the tool if": [
+        f"any group's AUC falls more than {FAIRNESS_AUC_GAP} below overall",
+        "calibration drifts (predicted vs. actual discharges stop matching)",
+        "a safety event is linked to the tool",
+    ],
+    "Review the tool if": ["the override rate stays outside 5–40% for 2 weeks"],
+    "Retire the tool after": ["2 failed retraining cycles"],
+}
+OVERSIGHT_OWNERS = {
+    "CMIO": "Accountable",
+    "Data analyst": "Monthly monitoring",
+    "AI oversight committee": "Decides to pause, retrain, or retire",
+}
 
 
 # ---------------------------------------------------------------------------
