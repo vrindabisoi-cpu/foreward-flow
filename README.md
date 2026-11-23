@@ -25,12 +25,19 @@ A staff-facing Streamlit dashboard for **emergency department (ED) patient flow 
 
 ### What-If tab
 
-Move the slider to choose how many hours earlier inpatient beds are ready (from earlier discharges and faster cleaning). Each boarder then leaves the ED up to that many hours sooner, never more than they actually boarded.
+Choose how many hours less each admitted patient boards in the ED. Earlier discharges and faster room cleaning are what make beds ready sooner. Two presets set the slider: **Month-18 goal: 1 hour less boarding (3.5 → 2.5 h)** and **Conservative: 45 minutes**. Every number shows its formula underneath.
 
-- **Value line 1 — Boarding cost avoided:** boarding hours avoided × $350.
-- **Value line 2 — Fewer patients leave without being seen (estimate).** Each freed ED room-hour serves about 0.30 more patients (233 arrivals/day ÷ 32 treatment rooms ÷ 24 h). The case's 4% left-without-being-seen rate is assumed to be recovered from those patients, at $1,500 average net revenue per ED visit.
+**Per year (case brief figures, to match the slides):** 85,000 ED visits × 16% admitted = **13,600 admissions**. Hours saved per admission is the slider value, capped at the 3.5-hour median boarding time.
 
-"Today" uses the current boarders. "Per year" uses an average day from the 30-day boarding history × 365. At 2 hours earlier, that's about $2.9M in boarding cost avoided and about 101 recovered visits (about $152K) per year. These are estimates, not forecasts.
+| | Month-18 goal (1 h) | Conservative (45 min) | Formula |
+|---|---|---|---|
+| **Value line 1 — Boarding cost avoided** | $4,760,000 | $3,570,000 | 13,600 × hours × $350 |
+| ED room-hours freed | 13,600 | 10,200 | 13,600 × hours |
+| Patients roomed sooner | 4,124 | 3,093 | room-hours × 0.303 patients/room-hour (233 arrivals/day ÷ 32 rooms ÷ 24 h) |
+| Recovered visits (estimate) | 165 | 124 | patients roomed sooner × 4% LWBS rate |
+| **Value line 2 — Recovered net revenue (estimate)** | $247,432 | $185,574 | recovered visits × $1,500 |
+
+**Today** uses the 6 current boarders: each leaves up to the slider value sooner, never more than they actually boarded. Value line 2 is labelled in the app as an estimate, not a forecast.
 
 ### Sidebar
 

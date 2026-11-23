@@ -1157,22 +1157,36 @@ def _value_lines(boarding_hours_saved: float) -> dict:
     }
 
 
-def what_if_beds_earlier(hours_earlier: float, ed_scored: pd.DataFrame, boarding_history: pd.DataFrame) -> dict:
+# Annual figures from the case brief, so results match the slides.
+ANNUAL_ADMISSIONS = round(ED_ARRIVALS_PER_YEAR * ED_ADMIT_RATE)  # 85,000 x 16% = 13,600
+MEDIAN_BOARDING_HOURS = 3.5  # case brief; cap on hours saved per admission
+
+WHAT_IF_PRESETS = {
+    "Month-18 goal: 1 hour less boarding (3.5 → 2.5 h)": 1.0,
+    "Conservative: 45 minutes": 0.75,
+}
+
+
+def what_if_beds_earlier(hours_earlier: float, ed_scored: pd.DataFrame) -> dict:
     """Value of inpatient beds being ready `hours_earlier` hours sooner.
 
-    Each boarder leaves the ED up to `hours_earlier` hours sooner (never more
-    than they actually boarded). That gives two value lines:
+    Per year (case brief figures): 13,600 admissions x hours saved per
+    admission (the slider, capped at the 3.5-hour median boarding time).
+    Today: each current boarder leaves up to `hours_earlier` hours sooner,
+    never more than they have actually boarded.
+
+    Two value lines:
       1. Boarding cost avoided: hours saved x $350.
       2. Fewer patients leave without being seen (ESTIMATE): freed ED room-hours
          x patients per room-hour x 4% LWBS rate = recovered visits, x $1,500.
-    "Today" uses the current boarders; "per year" uses the 30-day boarding
-    history's average day x 365.
     """
+    per_admission = min(hours_earlier, MEDIAN_BOARDING_HOURS)
     today = ed_scored.loc[ed_scored["status"] == "Boarding", "hours_boarding"]
-    today_saved = float(np.minimum(today, hours_earlier).sum())
-    hist_hours = boarding_history["boarding_minutes"] / 60
-    per_day = np.minimum(hist_hours, hours_earlier).groupby(boarding_history["date"]).sum().mean()
-    return {"today": _value_lines(today_saved), "per_year": _value_lines(float(per_day) * 365)}
+    today_lines = _value_lines(float(np.minimum(today, hours_earlier).sum()))
+    today_lines["boarders"] = len(today)
+    year_lines = _value_lines(ANNUAL_ADMISSIONS * per_admission)
+    year_lines["hours_per_admission"] = per_admission
+    return {"today": today_lines, "per_year": year_lines}
 
 
 # ---------------------------------------------------------------------------

@@ -517,44 +517,71 @@ with tab_flow:
 with tab_whatif:
     st.subheader("What if inpatient beds were ready earlier?")
     st.caption(
-        "Earlier discharges and faster room cleaning mean boarders leave the ED sooner. "
-        "Each boarder moves up to this many hours earlier (never more than they actually boarded)."
+        "Earlier discharges and faster room cleaning mean admitted patients board in the ED for less time."
     )
-    hours_earlier = st.slider("Hours earlier", 0.5, 4.0, 2.0, 0.5, format="%.1f h")
-    wi = fe.what_if_beds_earlier(hours_earlier, ed, data["boarding"])
+
+    def set_hours(h):
+        st.session_state["hours_earlier"] = h
+
+    st.session_state.setdefault("hours_earlier", 1.0)
+    preset_cols = st.columns(len(fe.WHAT_IF_PRESETS))
+    for i, (col, (label, h)) in enumerate(zip(preset_cols, fe.WHAT_IF_PRESETS.items())):
+        col.button(label, key=f"preset_{i}", on_click=set_hours, args=(h,), width="stretch",
+                   type="primary" if st.session_state["hours_earlier"] == h else "secondary")
+    hours_earlier = st.slider(
+        "Hours less boarding per admitted patient", 0.25, fe.MEDIAN_BOARDING_HOURS, step=0.25,
+        key="hours_earlier", format="%.2f h",
+        help=f"Capped at the {fe.MEDIAN_BOARDING_HOURS}-hour median boarding time.",
+    )
+    wi = fe.what_if_beds_earlier(hours_earlier, ed)
     today, year = wi["today"], wi["per_year"]
+    h = year["hours_per_admission"]
+    adm = fe.ANNUAL_ADMISSIONS
+    rate = fe.BOARDING_COST_PER_HOUR
+    pprh = fe.PATIENTS_PER_ROOM_HOUR
+
+    def stat(col, label, value, formula):
+        col.metric(label, value)
+        col.caption(formula)
 
     with st.container(border=True):
         st.markdown("**Value line 1 — Boarding cost avoided**")
         c1, c2, c3 = st.columns(3)
-        c1.metric("Boarding hours avoided today", f"{today['boarding_hours_saved']:.1f}")
-        c2.metric("Cost avoided today", f"${today['boarding_cost_avoided']:,.0f}")
-        c3.metric("Cost avoided per year", f"${year['boarding_cost_avoided']:,.0f}")
-        st.caption(f"Boarding hours avoided × ${fe.BOARDING_COST_PER_HOUR} per boarding hour.")
+        stat(c1, "Boarding hours avoided per year", f"{year['boarding_hours_saved']:,.0f}",
+             f"{adm:,} admissions × {h:.2f} h")
+        stat(c2, "Cost avoided per year", f"${year['boarding_cost_avoided']:,.0f}",
+             f"{adm:,} admissions × {h:.2f} h × ${rate}/h")
+        stat(c3, "Cost avoided today", f"${today['boarding_cost_avoided']:,.0f}",
+             f"{today['boarders']} current boarders, up to {hours_earlier:.2f} h each "
+             f"= {today['boarding_hours_saved']:.1f} h × ${rate}/h")
+        st.caption(
+            f"Per year: 85,000 ED visits × 16% admitted = {adm:,} admissions; hours saved per admission "
+            f"is capped at the {fe.MEDIAN_BOARDING_HOURS}-hour median boarding time."
+        )
 
     with st.container(border=True):
         st.markdown("**Value line 2 — Fewer patients leave without being seen (estimate)**")
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("ED room-hours freed per year", f"{year['room_hours_freed']:,.0f}")
-        c2.metric("Patients roomed sooner per year", f"{year['patients_roomed_sooner']:,.0f}")
-        c3.metric("Recovered visits per year (est.)", f"{year['recovered_visits']:,.0f}")
-        c4.metric("Recovered net revenue per year (est.)", f"${year['recovered_revenue']:,.0f}")
+        stat(c1, "ED room-hours freed per year", f"{year['room_hours_freed']:,.0f}",
+             f"{adm:,} admissions × {h:.2f} h (each boarder holds one room)")
+        stat(c2, "Patients roomed sooner per year", f"{year['patients_roomed_sooner']:,.0f}",
+             f"{year['room_hours_freed']:,.0f} room-hours × {pprh:.3f} patients/room-hour")
+        stat(c3, "Recovered visits per year (est.)", f"{year['recovered_visits']:,.0f}",
+             f"{year['patients_roomed_sooner']:,.0f} patients × {fe.LWBS_RATE:.0%} LWBS rate")
+        stat(c4, "Recovered net revenue per year (est.)", f"${year['recovered_revenue']:,.0f}",
+             f"{year['recovered_visits']:,.1f} visits × ${fe.NET_REVENUE_PER_VISIT:,}/visit")
         st.caption(
-            f"Today: {today['room_hours_freed']:.1f} room-hours freed → "
-            f"{today['recovered_visits']:.2f} recovered visits (${today['recovered_revenue']:,.0f})."
+            f"Today: {today['room_hours_freed']:.1f} room-hours × {pprh:.3f} × {fe.LWBS_RATE:.0%} = "
+            f"{today['recovered_visits']:.2f} recovered visits × ${fe.NET_REVENUE_PER_VISIT:,} = "
+            f"${today['recovered_revenue']:,.0f}."
         )
         st.warning(
-            "**This is an estimate, not a forecast.** Each ED room-hour freed from boarding serves "
-            f"about {fe.PATIENTS_PER_ROOM_HOUR:.2f} more patients (233 arrivals/day ÷ 32 treatment rooms "
-            f"÷ 24 h). Of those patients, the case's {fe.LWBS_RATE:.0%} left-without-being-seen rate is "
-            f"assumed to be recovered, at ${fe.NET_REVENUE_PER_VISIT:,} average net revenue per ED visit.",
+            "**This is an estimate, not a forecast.** Each ED room-hour freed from boarding serves about "
+            f"{pprh:.2f} more patients (233 arrivals/day ÷ 32 treatment rooms ÷ 24 h). Of those patients, the "
+            f"case's {fe.LWBS_RATE:.0%} left-without-being-seen rate is assumed to be recovered, at "
+            f"${fe.NET_REVENUE_PER_VISIT:,} average net revenue per ED visit.",
             icon="📐",
         )
-
-    st.caption(
-        "\"Today\" uses the 6 patients boarding now. \"Per year\" uses an average day from the "
-        "synthetic 30-day boarding history × 365."
-    )
 
 
 # =====================================================================================
