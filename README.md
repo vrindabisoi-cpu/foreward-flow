@@ -6,9 +6,10 @@ A staff-facing Streamlit dashboard for **emergency department (ED) patient flow 
 
 ## What it shows
 
-### AI Control Center tab
+### Command Center tab
 
-- **Live bed counts** per unit: 🟢 open, 🟡 needs cleaning, 🔴 occupied.
+- **Census strip** on every tab: hospital census, open beds, rooms to clean, ED boarders (longest wait), boarding cost today, waiting room.
+- **Inpatient beds by unit:** open / needs cleaning / occupied counts with a bar, plus each unit's outlook to 5 PM (e.g. "Projected to run out by 12 PM").
 - **ED room status:** 32 treatment rooms, 8 fast-track rooms, 4 resuscitation/trauma bays, 4 behavioral health rooms, and a 40-seat waiting room. Shows how many treatment rooms boarders are holding (e.g., "6 of 32 ED rooms held by boarders") and how many patients are waiting.
 - **ED boarding:** admitted patients boarding, total boarding hours, and today's boarding cost at $350 per boarding hour.
 - **8-hour bed forecast (9 AM–5 PM)** for a selected unit, with a red warning banner when the unit is projected to run out of beds. The banner lists the reasons and shows how many hours of head start staff have.
@@ -27,7 +28,7 @@ A staff-facing Streamlit dashboard for **emergency department (ED) patient flow 
 ### Barrier Flags tab
 
 - Inpatients ranked by **likely to go home today**, with probability and top reasons.
-- **Scan notes with AI** sends each note to the Claude API (official `anthropic` Python SDK, `POST /v1/messages`, structured JSON output). Claude returns each barrier tagged **Medical** or **Social** with a suggested owner team (Social work, Case management, Pharmacy, Hospitalist). It is told not to make clinical decisions, and only the note text is sent, never insurance or demographics.
+- **Scan nursing notes** sends each note to the Claude API (official `anthropic` Python SDK, `POST /v1/messages`, structured JSON output). Claude returns each barrier tagged **Medical** or **Social** with a suggested owner team (Social work, Case management, Pharmacy, Hospitalist). It is told not to make clinical decisions, and only the note text is sent, never insurance or demographics.
 - **API key:** entered in the sidebar password box or set as `ANTHROPIC_API_KEY`. It is never hard-coded, saved, or logged. The model name is editable in the sidebar; the default is `claude-opus-5-5`. Server-side refusal fallback is on for models that support it.
 - **Three sources, in this order:**
   1. **Claude API:** a live call, when an API key is set.
@@ -41,7 +42,7 @@ A staff-facing Streamlit dashboard for **emergency department (ED) patient flow 
 
 ### What-If tab
 
-**Medicine today: operational actions.** Starts from the Control Center's Medicine forecast (same day, trend, applied alerts, and physician overrides). The actions are:
+**Medicine today: operational actions.** Starts from the Command Center's Medicine forecast (same day, trend, applied alerts, and physician overrides). The actions are:
 - **Open discharge lounge:** beds free about 2 hours earlier.
 - **Clear social barriers by 10 AM:** uses the Barrier Flags scan, or documented barriers if notes haven't been scanned. Those patients are re-scored without the barrier.
 - **Flex beds:** 0–6, opening from 10 AM.
@@ -100,17 +101,25 @@ Header: **Insurance, race, and language are never model inputs; they are used on
   - *Owners:* the CMIO (accountable), a data analyst (monthly monitoring), and the AI oversight committee (decides).
 - **Full decision log** with CSV download and Clear log (house supervisor only).
 
+## Interface design
+
+Built for clinical staff rather than as a tech demo:
+- **Calm, clinical look:** navy header bar with date, board time, shift, and the signed-in role; white panels on a light gray page; no emoji.
+- **Status colors are reserved:** green = open / OK, amber = cleaning / needs attention, red = run-out or alert. Occupied beds are neutral gray (a full bed is normal, not an alarm).
+- **Plain labels:** "Suggested bed type", "Admission likelihood", "Likely home today". Every suggestion still requires a person to accept, override, approve, or assign.
+- **Sidebar:** role first (with what that role can do), then forecast settings, operating mode, staffing, and system settings (API key, model performance) tucked into expanders.
+
 ## 90-second demo script
 
 Start with default inputs (**Monday 9 AM, elevated flu/RSV**). Clear the decision log first so the run starts clean.
 
 | Time | Do this | Say / show |
 |---|---|---|
-| 0:00 | **AI Control Center** | "It's Monday 9 AM in flu season. **Medicine runs out of beds by 12 PM**, short about 2 by 2 PM. That's a 3-hour head start." |
-| 0:10 | Point to the tier, then click **Approve** on "Open the discharge lounge" (acting as House supervisor) | "Level 1 — Tight. The house supervisor approves each action, and every decision is logged." |
+| 0:00 | **Command Center** | "It's Monday 9 AM in flu season. **Medicine runs out of beds by 12 PM**, short about 2 by 2 PM. That's a 3-hour head start." |
+| 0:10 | Point to the tier, then click **Approve** on "Open the discharge lounge" (signed in as House supervisor) | "Level 1 — Tight. The house supervisor approves each action, and every decision is logged." |
 | 0:20 | News alerts → **Apply to forecast** on "Nearby hospital diverting ambulances" | "News never changes the forecast unless a person applies it. With diversion: short about 3, **escalates to Level 2 — Full**." |
-| 0:30 | **Barrier Flags** → **Scan notes with AI**. Switch "Acting as" to **Social worker**, then **Assign to Social work** on a "No ride home" flag | "Claude reads the notes (or the offline fallback does) and flags barriers. Social barriers go to the right team." |
-| 0:45 | **ED Admissions**, acting as **Physician** → **Override** ED-201 to **ICU** (reason: different level of care) | "The physician confirms level of care. The Control Center shows **Forecast updated by physician override**." |
+| 0:30 | **Barrier Flags** → **Scan nursing notes**. Switch "Signed in as" to **Social worker**, then **Assign to Social work** on a "No ride home" flag | "Claude reads the notes (or the offline fallback does) and flags barriers. Social barriers go to the right team." |
+| 0:45 | **ED Admissions**, signed in as **Physician** → **Override** ED-201 to **ICU** (reason: different level of care) | "The physician confirms level of care. The Command Center shows **Forecast updated by physician override**." |
 | 0:55 | **What-If** → tick **Clear social barriers by 10 AM** and **Open discharge lounge** | "**The shortage disappears.** Boarding hours and dollars saved today, plus $4.76M a year if boarding drops 1 hour per admission." |
 | 1:10 | **Equity & Oversight** | "**Medicaid/CHIP patients board 37 min longer**, and the alert fires. The Phase 1 bias test **catches age 65–79 before go-live**: do not go live, retrain and re-test." |
 | 1:20 | Sidebar → **Silent mode** | "Phase 1 pilot: predictions are logged for validation and hidden from staff." |

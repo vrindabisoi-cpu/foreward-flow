@@ -781,7 +781,7 @@ def rank_inpatients(model: ExplainableLogit, inpatients: pd.DataFrame) -> pd.Dat
 
 
 # ---------------------------------------------------------------------------
-# AI Control Center: boarding cost, 8-hour bed forecast, capacity tiers
+# Command Center: boarding cost, 8-hour bed forecast, capacity tiers
 # ---------------------------------------------------------------------------
 
 BOARDING_COST_PER_HOUR = 350  # dollars per boarding hour
@@ -1643,7 +1643,7 @@ OVERSIGHT_OWNERS = {
 # Silent mode, manual mode, footer
 # ---------------------------------------------------------------------------
 
-FOOTER_TEXT = ("AI recommendations only — a qualified human approves every action. "
+FOOTER_TEXT = ("Decision support only — a qualified clinician approves every action. "
                "Insurance, race, and language are never model inputs. "
                "All data is synthetic, calibrated to the Halvian case brief.")
 
